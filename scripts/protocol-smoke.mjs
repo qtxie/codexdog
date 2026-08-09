@@ -57,6 +57,23 @@ try {
   await observed;
   client.send(JSON.stringify({ method: "initialized", params: {} }));
   await proxy.request("thread/list", { limit: 1 });
+  const started = await proxy.request("thread/start", {
+    cwd,
+    ephemeral: true,
+    sandbox: "read-only",
+    approvalPolicy: "never",
+  });
+  const smokeThreadId = started?.thread?.id;
+  if (typeof smokeThreadId !== "string") {
+    throw new Error("App server did not return an ephemeral smoke-test thread");
+  }
+  const read = await proxy.request("thread/read", {
+    threadId: smokeThreadId,
+    includeTurns: false,
+  });
+  if (read?.thread?.id !== smokeThreadId || typeof read?.thread?.status?.type !== "string") {
+    throw new Error("App server did not return the smoke-test thread status");
+  }
 
   if (process.argv.includes("--canary")) {
     probe = new ProviderProbe(rpc, {

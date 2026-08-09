@@ -23,6 +23,7 @@ describe("StateStore", () => {
       cwd: process.cwd(),
       phase: "starting",
       automaticResumeCount: 0,
+      stallRecoveryCount: 0,
       probeAttempt: 0,
       consecutiveProbeSuccesses: 0,
       controlToken: "secret",

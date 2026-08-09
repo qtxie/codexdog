@@ -7,6 +7,8 @@ export type RuntimePhase =
   | "idle"
   | "running"
   | "waiting-for-user"
+  | "suspected-stall"
+  | "interrupting-stall"
   | "provider-down"
   | "probing"
   | "resuming"
@@ -27,8 +29,12 @@ export interface SupervisorState {
   lastFailedTurnId?: string;
   resumeRequestedForTurnId?: string;
   automaticResumeCount: number;
+  stallRecoveryCount: number;
   probeAttempt: number;
   consecutiveProbeSuccesses: number;
+  lastTurnActivityAt?: string;
+  stallSuspectedAt?: string;
+  stallPausedReason?: string;
   nextProbeAt?: string;
   lastError?: string;
   updatedAt: string;

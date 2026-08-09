@@ -17,9 +17,11 @@ import {
   readTurn,
   readTurnError,
   type JsonRpcMessage,
+  type Turn,
   type TurnError,
 } from "./protocol.js";
 import { ProviderProbe } from "./provider-probe.js";
+import { StallWatchdog, type StallContext } from "./stall-watchdog.js";
 import { type StateStore, type SupervisorState } from "./state-store.js";
 import { TuiProxy } from "./tui-proxy.js";
 
@@ -34,6 +36,11 @@ export interface SupervisorOptions {
   probeSuccesses: number;
   backoffMs: number[];
   maxAutoResumes: number;
+  stallTimeoutMs: number;
+  stallConfirmMs: number;
+  stallInterruptTimeoutMs: number;
+  maxStallResumes: number;
+  toolStallTimeoutMs: number;
 }
 
 interface RecoveryContext {
@@ -42,12 +49,24 @@ interface RecoveryContext {
   failure: ClassifiedFailure;
 }
 
+interface TurnTerminalWaiter {
+  resolve: (status: Turn["status"] | undefined) => void;
+  timer: NodeJS.Timeout;
+}
+
+interface ThreadRuntimeStatus {
+  type: string;
+  activeFlags: string[];
+}
+
 const CONTINUATION_PROMPT =
   "The previous turn ended because the model provider was unavailable. Continue the unfinished task from the existing thread and workspace state. Inspect existing work first, verify what already completed, and do not repeat completed steps.";
+const STALL_CONTINUATION_PROMPT = "continue";
 
 export class Supervisor {
   private state: SupervisorState;
   private readonly logger: Logger;
+  private readonly stallWatchdog: StallWatchdog;
   private appServer?: ChildProcess;
   private tui?: ChildProcess;
   private proxy?: TuiProxy;
@@ -58,21 +77,33 @@ export class Supervisor {
   private recoveryAbort: AbortController | undefined;
   private pendingRecovery: RecoveryContext | undefined;
   private submittingResume = false;
+  private stallCheckInFlight = false;
+  private stallRecoveryGeneration = 0;
+  private stallTimer: NodeJS.Timeout | undefined;
+  private activityPersistTimer: NodeJS.Timeout | undefined;
   private readonly turnErrors = new Map<string, TurnError>();
   private readonly handledTurns = new Set<string>();
   private readonly cyberPolicyAttempts = new Map<string, number>();
+  private readonly watchdogInterruptedTurns = new Set<string>();
+  private readonly turnTerminalWaiters = new Map<string, TurnTerminalWaiter>();
 
   constructor(
     private readonly options: SupervisorOptions,
     private readonly store: StateStore,
   ) {
     this.logger = new Logger(store.logPath);
+    this.stallWatchdog = new StallWatchdog({
+      stallTimeoutMs: options.stallTimeoutMs,
+      stallConfirmMs: options.stallConfirmMs,
+      toolStallTimeoutMs: options.toolStallTimeoutMs,
+    });
     this.state = {
       version: 1,
       pid: process.pid,
       cwd: options.cwd,
       phase: "starting",
       automaticResumeCount: 0,
+      stallRecoveryCount: 0,
       probeAttempt: 0,
       consecutiveProbeSuccesses: 0,
       updatedAt: new Date().toISOString(),
@@ -116,6 +147,7 @@ export class Supervisor {
       this.state.controlToken = this.control.token;
       this.state.phase = "idle";
       await this.persist();
+      this.startStallWatchdog();
 
       const proxyUrl = `ws://127.0.0.1:${proxyPort}`;
       process.stdout.write(`Codex supervisor is active for ${this.options.cwd}\n`);
@@ -171,6 +203,20 @@ export class Supervisor {
   }
 
   private handleClientMessage(message: JsonRpcMessage): void {
+    if (message.method === "turn/interrupt") {
+      const turnId = message.params ? readString(message.params.turnId) : undefined;
+      this.stallRecoveryGeneration += 1;
+      this.stallWatchdog.cancelRecovery();
+      this.syncStallState();
+      if (turnId) {
+        this.watchdogInterruptedTurns.delete(turnId);
+        this.cancelTurnTerminalWaiter(turnId);
+      }
+      this.logger.log(
+        `User requested an interrupt${turnId ? ` for turn ${turnId}` : ""}; stall recovery cancelled`,
+      );
+      return;
+    }
     if (message.method !== "turn/start") {
       return;
     }
@@ -186,6 +232,9 @@ export class Supervisor {
     }
     if (!this.submittingResume && threadId) {
       this.cyberPolicyAttempts.delete(threadId);
+      this.stallRecoveryGeneration += 1;
+      this.state.stallRecoveryCount = 0;
+      this.clearStallState();
     }
     this.state.phase = "running";
     this.state.probeAttempt = 0;
@@ -198,6 +247,17 @@ export class Supervisor {
     const params = message.params;
     if (!params || !message.method) {
       return;
+    }
+
+    const stallObservation = this.stallWatchdog.observeServerMessage(message);
+    if (stallObservation.activity) {
+      this.syncStallState();
+      if (stallObservation.suspicionCleared && this.state.phase === "suspected-stall") {
+        this.state.phase = isUserWaitReason(this.state.stallPausedReason)
+          ? "waiting-for-user"
+          : "running";
+      }
+      this.scheduleActivityPersist();
     }
 
     if (message.method === "thread/started") {
@@ -233,6 +293,10 @@ export class Supervisor {
       }
       if (turn) {
         this.state.activeTurnId = turn.id;
+        if (threadId) {
+          this.stallWatchdog.startTurn(threadId, turn.id);
+          this.syncStallState();
+        }
       }
       this.state.phase = "running";
       await this.persist();
@@ -249,15 +313,21 @@ export class Supervisor {
       return;
     }
     this.handledTurns.add(turn.id);
+    const hadTerminalWaiter = this.resolveTurnTerminalWaiter(turn);
+    const wasWatchdogInterrupted = this.watchdogInterruptedTurns.delete(turn.id);
+    this.stallWatchdog.completeTurn(turn.id);
+    this.syncStallState();
     this.state.currentThreadId = threadId;
     delete this.state.activeTurnId;
 
     if (turn.status === "completed") {
+      this.stallRecoveryGeneration += 1;
       this.turnErrors.delete(turn.id);
       this.cyberPolicyAttempts.delete(threadId);
       this.cancelRecovery();
       this.state.phase = "idle";
       this.state.automaticResumeCount = 0;
+      this.state.stallRecoveryCount = 0;
       this.state.probeAttempt = 0;
       this.state.consecutiveProbeSuccesses = 0;
       delete this.state.lastError;
@@ -271,8 +341,24 @@ export class Supervisor {
       this.turnErrors.delete(turn.id);
       this.cyberPolicyAttempts.delete(threadId);
       this.cancelRecovery();
+
+      if (wasWatchdogInterrupted) {
+        if (hadTerminalWaiter) {
+          this.state.phase = "resuming";
+          await this.persist();
+          this.logger.log(`Watchdog interrupt completed for stalled turn ${turn.id}`);
+        } else {
+          await this.setAttention(
+            `Watchdog interrupt completed late for ${turn.id}; manual continuation is required`,
+          );
+        }
+        return;
+      }
+
+      this.stallRecoveryGeneration += 1;
       this.state.phase = "idle";
       this.state.automaticResumeCount = 0;
+      this.state.stallRecoveryCount = 0;
       delete this.state.nextProbeAt;
       await this.persist();
       this.logger.log(`Turn ${turn.id} was interrupted; no recovery scheduled`);
@@ -311,7 +397,293 @@ export class Supervisor {
     if (type === "active" && waiting) {
       this.state.phase = "waiting-for-user";
       void this.persist();
+    } else if (type === "active" && this.state.phase === "waiting-for-user") {
+      this.state.phase = "running";
+      void this.persist();
     }
+  }
+
+  private startStallWatchdog(): void {
+    if (!this.stallWatchdog.enabled || this.stallTimer) {
+      return;
+    }
+    const intervalMs = Math.max(
+      1_000,
+      Math.min(5_000, Math.floor(this.options.stallConfirmMs / 2)),
+    );
+    this.stallTimer = setInterval(() => void this.evaluateStall(), intervalMs);
+    this.stallTimer.unref();
+    this.logger.log(
+      `Stall watchdog enabled (timeout=${this.options.stallTimeoutMs}ms, confirmation=${this.options.stallConfirmMs}ms)`,
+    );
+  }
+
+  private async evaluateStall(now = Date.now()): Promise<void> {
+    if (
+      this.shuttingDown ||
+      this.stallCheckInFlight ||
+      this.submittingResume ||
+      this.recoveryAbort ||
+      this.state.phase === "needs-attention" ||
+      this.state.phase === "stopped"
+    ) {
+      return;
+    }
+
+    const decision = this.stallWatchdog.evaluate(now);
+    this.syncStallState();
+    if (!decision) {
+      return;
+    }
+
+    if (decision.kind === "suspected") {
+      this.state.phase = "suspected-stall";
+      await this.persist();
+      this.logger.log(
+        `Turn ${decision.context.turnId} may be stalled after ${decision.context.idleMs}ms without activity`,
+      );
+      return;
+    }
+
+    this.stallCheckInFlight = true;
+    const generation = ++this.stallRecoveryGeneration;
+    try {
+      await this.confirmAndRecoverStall(decision.context, generation);
+    } finally {
+      this.stallCheckInFlight = false;
+    }
+  }
+
+  private async confirmAndRecoverStall(
+    context: StallContext,
+    generation: number,
+  ): Promise<void> {
+    if (!this.proxy) {
+      this.stallWatchdog.cancelRecovery();
+      await this.setAttention("Stall recovery is unavailable before the TUI proxy starts");
+      return;
+    }
+    if (this.state.stallRecoveryCount >= this.options.maxStallResumes) {
+      await this.setAttention(
+        `Stalled-turn resume limit (${this.options.maxStallResumes}) reached for ${context.threadId}`,
+      );
+      return;
+    }
+    if (this.state.automaticResumeCount >= this.options.maxAutoResumes) {
+      await this.setAttention(
+        `Automatic resume limit (${this.options.maxAutoResumes}) reached for ${context.threadId}`,
+      );
+      return;
+    }
+
+    try {
+      const result = await this.proxy.request<{ thread?: unknown }>(
+        "thread/read",
+        { threadId: context.threadId, includeTurns: false },
+        this.options.stallInterruptTimeoutMs,
+      );
+      if (generation !== this.stallRecoveryGeneration || !this.stallWatchdog.isCurrent(context)) {
+        this.stallWatchdog.cancelRecovery();
+        this.syncStallState();
+        return;
+      }
+
+      const status = readThreadRuntimeStatus(result.thread);
+      if (!status) {
+        throw new Error("Codex did not return the stalled thread status");
+      }
+      if (status.type !== "active") {
+        this.stallWatchdog.completeTurn(context.turnId);
+        this.syncStallState();
+        delete this.state.activeTurnId;
+        if (status.type === "idle") {
+          this.state.phase = "idle";
+          await this.persist();
+          this.logger.log(
+            `Stall confirmation cancelled because thread ${context.threadId} is idle`,
+          );
+        } else {
+          await this.setAttention(
+            `Stall confirmation found thread ${context.threadId} in ${status.type} state`,
+          );
+        }
+        return;
+      }
+
+      const waitingFlags = status.activeFlags.filter(
+        (flag) => flag === "waitingOnApproval" || flag === "waitingOnUserInput",
+      );
+      if (waitingFlags.length > 0) {
+        this.stallWatchdog.setWaitingFlags(context.threadId, waitingFlags);
+        this.syncStallState();
+        this.state.phase = "waiting-for-user";
+        await this.persist();
+        this.logger.log(
+          `Stall confirmation cancelled because thread ${context.threadId} is ${waitingFlags[0]}`,
+        );
+        return;
+      }
+
+      if (generation !== this.stallRecoveryGeneration || !this.stallWatchdog.isCurrent(context)) {
+        this.stallWatchdog.cancelRecovery();
+        this.syncStallState();
+        return;
+      }
+
+      this.state.phase = "interrupting-stall";
+      await this.persist();
+      this.logger.log(`Interrupting confirmed stalled turn ${context.turnId}`);
+
+      this.watchdogInterruptedTurns.add(context.turnId);
+      const terminal = this.waitForTurnTerminal(context.turnId);
+      try {
+        await this.proxy.request(
+          "turn/interrupt",
+          { threadId: context.threadId, turnId: context.turnId },
+          this.options.stallInterruptTimeoutMs,
+        );
+      } catch (error) {
+        this.cancelTurnTerminalWaiter(context.turnId);
+        if (!(error instanceof Error) || !error.message.includes("timed out")) {
+          this.watchdogInterruptedTurns.delete(context.turnId);
+        }
+        throw error;
+      }
+
+      const terminalStatus = await terminal;
+      if (generation !== this.stallRecoveryGeneration) {
+        return;
+      }
+      if (terminalStatus === undefined) {
+        throw new Error(`Codex did not finish interrupted turn ${context.turnId}`);
+      }
+      if (terminalStatus !== "interrupted") {
+        return;
+      }
+      await this.resumeStalledThread(context, generation);
+    } catch (error) {
+      if (generation === this.stallRecoveryGeneration && !this.shuttingDown) {
+        this.stallWatchdog.cancelRecovery();
+        this.syncStallState();
+        await this.setAttention(
+          `Stall recovery failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+
+  private async resumeStalledThread(context: StallContext, generation: number): Promise<void> {
+    if (!this.proxy || generation !== this.stallRecoveryGeneration) {
+      return;
+    }
+
+    this.submittingResume = true;
+    this.state.phase = "resuming";
+    this.state.resumeRequestedForTurnId = context.turnId;
+    this.state.automaticResumeCount += 1;
+    this.state.stallRecoveryCount += 1;
+    delete this.state.nextProbeAt;
+    await this.persist();
+
+    try {
+      await this.proxy.request("thread/resume", {
+        threadId: context.threadId,
+        cwd: this.options.cwd,
+      });
+      const result = await this.proxy.request<{ turn?: unknown }>("turn/start", {
+        threadId: context.threadId,
+        input: [{ type: "text", text: STALL_CONTINUATION_PROMPT }],
+        cwd: this.options.cwd,
+        clientUserMessageId: `codex-supervisor:stall:${this.state.stallRecoveryCount}:${context.turnId}`,
+      });
+      const turn = readTurn(result.turn);
+      if (!turn) {
+        throw new Error("Codex did not return a stalled-turn continuation");
+      }
+
+      this.stallWatchdog.startTurn(context.threadId, turn.id);
+      this.syncStallState();
+      this.state.phase = "running";
+      this.state.activeTurnId = turn.id;
+      this.state.currentThreadId = context.threadId;
+      this.state.probeAttempt = 0;
+      this.state.consecutiveProbeSuccesses = 0;
+      await this.persist();
+      this.logger.log(
+        `Resumed stalled thread ${context.threadId} as turn ${turn.id} after interrupting ${context.turnId}`,
+      );
+    } finally {
+      this.submittingResume = false;
+    }
+  }
+
+  private waitForTurnTerminal(turnId: string): Promise<Turn["status"] | undefined> {
+    this.cancelTurnTerminalWaiter(turnId);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.turnTerminalWaiters.delete(turnId);
+        resolve(undefined);
+      }, this.options.stallInterruptTimeoutMs);
+      timer.unref();
+      this.turnTerminalWaiters.set(turnId, { resolve, timer });
+    });
+  }
+
+  private resolveTurnTerminalWaiter(turn: Turn): boolean {
+    const waiter = this.turnTerminalWaiters.get(turn.id);
+    if (!waiter) {
+      return false;
+    }
+    this.turnTerminalWaiters.delete(turn.id);
+    clearTimeout(waiter.timer);
+    waiter.resolve(turn.status);
+    return true;
+  }
+
+  private cancelTurnTerminalWaiter(turnId: string): void {
+    const waiter = this.turnTerminalWaiters.get(turnId);
+    if (!waiter) {
+      return;
+    }
+    this.turnTerminalWaiters.delete(turnId);
+    clearTimeout(waiter.timer);
+    waiter.resolve(undefined);
+  }
+
+  private syncStallState(): void {
+    const snapshot = this.stallWatchdog.snapshot();
+    if (snapshot.lastActivityAt !== undefined) {
+      this.state.lastTurnActivityAt = new Date(snapshot.lastActivityAt).toISOString();
+    } else {
+      delete this.state.lastTurnActivityAt;
+    }
+    if (snapshot.suspectedAt !== undefined) {
+      this.state.stallSuspectedAt = new Date(snapshot.suspectedAt).toISOString();
+    } else {
+      delete this.state.stallSuspectedAt;
+    }
+    if (snapshot.pauseReason) {
+      this.state.stallPausedReason = snapshot.pauseReason;
+    } else {
+      delete this.state.stallPausedReason;
+    }
+  }
+
+  private clearStallState(): void {
+    delete this.state.lastTurnActivityAt;
+    delete this.state.stallSuspectedAt;
+    delete this.state.stallPausedReason;
+  }
+
+  private scheduleActivityPersist(): void {
+    if (!this.stallWatchdog.enabled || this.activityPersistTimer) {
+      return;
+    }
+    this.activityPersistTimer = setTimeout(() => {
+      this.activityPersistTimer = undefined;
+      void this.persist();
+    }, 2_000);
+    this.activityPersistTimer.unref();
   }
 
   private async recoverCyberPolicy(context: RecoveryContext): Promise<void> {
@@ -382,6 +754,8 @@ export class Supervisor {
         throw new Error("Codex did not return a cyber policy recovery turn");
       }
 
+      this.stallWatchdog.startTurn(targetThreadId, turn.id);
+      this.syncStallState();
       this.state.phase = "running";
       this.state.activeTurnId = turn.id;
       this.state.currentThreadId = targetThreadId;
@@ -532,6 +906,8 @@ export class Supervisor {
       if (!turn) {
         throw new Error("Codex did not return a resumed turn");
       }
+      this.stallWatchdog.startTurn(context.threadId, turn.id);
+      this.syncStallState();
       this.state.phase = "running";
       this.state.activeTurnId = turn.id;
       this.state.currentThreadId = context.threadId;
@@ -562,6 +938,10 @@ export class Supervisor {
   }
 
   private async persist(): Promise<void> {
+    if (this.activityPersistTimer) {
+      clearTimeout(this.activityPersistTimer);
+      this.activityPersistTimer = undefined;
+    }
     this.state.updatedAt = new Date().toISOString();
     await this.store.write(this.state);
   }
@@ -580,6 +960,19 @@ export class Supervisor {
       return;
     }
     this.shuttingDown = true;
+    this.stallRecoveryGeneration += 1;
+    if (this.stallTimer) {
+      clearInterval(this.stallTimer);
+      this.stallTimer = undefined;
+    }
+    if (this.activityPersistTimer) {
+      clearTimeout(this.activityPersistTimer);
+      this.activityPersistTimer = undefined;
+    }
+    for (const turnId of this.turnTerminalWaiters.keys()) {
+      this.cancelTurnTerminalWaiter(turnId);
+    }
+    this.watchdogInterruptedTurns.clear();
     this.cancelRecovery();
     this.logger.log(`Stopping supervisor: ${reason}`);
 
@@ -596,6 +989,24 @@ export class Supervisor {
     this.appServer?.kill();
     await this.control?.close().catch(() => undefined);
   }
+}
+
+function readThreadRuntimeStatus(value: unknown): ThreadRuntimeStatus | undefined {
+  if (!isRecord(value) || !isRecord(value.status)) {
+    return undefined;
+  }
+  const type = readString(value.status.type);
+  if (!type) {
+    return undefined;
+  }
+  const flags = Array.isArray(value.status.activeFlags)
+    ? value.status.activeFlags.filter((flag): flag is string => typeof flag === "string")
+    : [];
+  return { type, activeFlags: flags };
+}
+
+function isUserWaitReason(value: string | undefined): boolean {
+  return value === "waitingOnApproval" || value === "waitingOnUserInput";
 }
 
 async function getFreePort(): Promise<number> {

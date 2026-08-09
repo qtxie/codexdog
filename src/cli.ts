@@ -41,6 +41,10 @@ async function main(): Promise<number> {
           `Thread: ${visible.currentThreadId ?? "-"}`,
           `Turn: ${visible.activeTurnId ?? "-"}`,
           `Automatic resumes: ${visible.automaticResumeCount}`,
+          `Stall resumes: ${visible.stallRecoveryCount ?? 0}`,
+          `Last turn activity: ${visible.lastTurnActivityAt ?? "-"}`,
+          `Stall suspected: ${visible.stallSuspectedAt ?? "-"}`,
+          `Watchdog pause: ${visible.stallPausedReason ?? "-"}`,
           `Last error: ${visible.lastError ?? "-"}`,
           `Updated: ${visible.updatedAt}`,
         ].join("\n") + "\n",
@@ -93,6 +97,11 @@ function parseArguments(argv: string[]): ParsedArguments {
   let probeTimeoutMs = 120_000;
   let probeSuccesses = 2;
   let maxAutoResumes = 5;
+  let stallTimeoutMs = 0;
+  let stallConfirmMs = 30_000;
+  let stallInterruptTimeoutMs = 15_000;
+  let maxStallResumes = 2;
+  let toolStallTimeoutMs = 0;
   let backoffMs = DEFAULT_BACKOFF;
   let json = false;
   const codexConfig: string[] = [];
@@ -139,6 +148,21 @@ function parseArguments(argv: string[]): ParsedArguments {
       case "--max-auto-resumes":
         maxAutoResumes = positiveInteger(valueAfter(arg), arg);
         break;
+      case "--stall-timeout-ms":
+        stallTimeoutMs = nonNegativeInteger(valueAfter(arg), arg);
+        break;
+      case "--stall-confirm-ms":
+        stallConfirmMs = positiveInteger(valueAfter(arg), arg);
+        break;
+      case "--stall-interrupt-timeout-ms":
+        stallInterruptTimeoutMs = positiveInteger(valueAfter(arg), arg);
+        break;
+      case "--max-stall-resumes":
+        maxStallResumes = positiveInteger(valueAfter(arg), arg);
+        break;
+      case "--tool-stall-timeout-ms":
+        toolStallTimeoutMs = nonNegativeInteger(valueAfter(arg), arg);
+        break;
       case "--backoff-ms":
         backoffMs = valueAfter(arg)
           .split(",")
@@ -174,6 +198,11 @@ function parseArguments(argv: string[]): ParsedArguments {
     probeSuccesses,
     backoffMs,
     maxAutoResumes,
+    stallTimeoutMs,
+    stallConfirmMs,
+    stallInterruptTimeoutMs,
+    maxStallResumes,
+    toolStallTimeoutMs,
   };
 }
 
@@ -181,6 +210,14 @@ function positiveInteger(value: string, flag: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
     throw new Error(`${flag} requires a positive integer`);
+  }
+  return parsed;
+}
+
+function nonNegativeInteger(value: string, flag: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${flag} requires a non-negative integer`);
   }
   return parsed;
 }
@@ -203,12 +240,19 @@ Options:
   --probe-successes N         Successes required before resume (default: 2)
   --backoff-ms LIST           Comma-separated retry delays
   --max-auto-resumes N        Consecutive automatic resume limit (default: 5)
+  --stall-timeout-ms MS       Silent-turn timeout; 0 disables it (default: 0)
+  --stall-confirm-ms MS       Silence confirmation window (default: 30000)
+  --stall-interrupt-timeout-ms MS
+                               Interrupt/confirmation RPC timeout (default: 15000)
+  --max-stall-resumes N       Consecutive stalled-turn resume limit (default: 2)
+  --tool-stall-timeout-ms MS  Silent active-tool timeout; 0 disables it (default: 0)
   --state-dir DIR             State and log directory
   --json                      JSON output for status
   -h, --help                  Show help
 
 Examples:
   codex-supervisor start -C D:\\work\\repo
+  codex-supervisor start -C . --stall-timeout-ms 600000
   codex-supervisor start -C . -- --sandbox workspace-write
   codex-supervisor status -C . --json
 `);

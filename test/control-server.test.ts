@@ -19,6 +19,7 @@ describe("control server", () => {
       cwd: process.cwd(),
       phase: "idle",
       automaticResumeCount: 0,
+      stallRecoveryCount: 0,
       probeAttempt: 0,
       consecutiveProbeSuccesses: 0,
       updatedAt: new Date().toISOString(),

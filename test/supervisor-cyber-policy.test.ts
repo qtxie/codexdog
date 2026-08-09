@@ -58,6 +58,11 @@ describe("Supervisor cyber policy recovery", () => {
       probeSuccesses: 2,
       backoffMs: [1_000],
       maxAutoResumes: 5,
+      stallTimeoutMs: 0,
+      stallConfirmMs: 30_000,
+      stallInterruptTimeoutMs: 15_000,
+      maxStallResumes: 2,
+      toolStallTimeoutMs: 0,
     };
     const supervisor = new Supervisor(options, store);
     const harness = supervisor as unknown as SupervisorHarness;
