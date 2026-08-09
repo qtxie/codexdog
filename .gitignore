@@ -2,5 +2,8 @@ node_modules/
 dist/
 coverage/
 *.log
+*.test
+codexdog
+codexdog.exe
 .codex-supervisor-state/
 .codex/

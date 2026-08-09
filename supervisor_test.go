@@ -1,0 +1,172 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+type recordedRequest struct {
+	Method string
+	Params map[string]any
+}
+
+type mockProxy struct {
+	mu      sync.Mutex
+	request func(context.Context, string, map[string]any) (any, error)
+	records []recordedRequest
+}
+
+func (m *mockProxy) Request(ctx context.Context, method string, params map[string]any) (any, error) {
+	m.mu.Lock()
+	m.records = append(m.records, recordedRequest{Method: method, Params: params})
+	m.mu.Unlock()
+	return m.request(ctx, method, params)
+}
+
+func (m *mockProxy) methods() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]string, len(m.records))
+	for index, record := range m.records {
+		result[index] = record.Method
+	}
+	return result
+}
+
+func testSupervisorOptions(cwd string) supervisorOptions {
+	return supervisorOptions{CWD: cwd, CodexPath: "codex", ProbeTimeout: 30 * time.Second, ProbeSuccesses: 2, Backoff: []time.Duration{time.Second}, MaxAutoResumes: 5, StallTimeout: 100 * time.Millisecond, StallConfirm: 50 * time.Millisecond, StallInterruptTimeout: time.Second, MaxStallResumes: 2}
+}
+
+func cyberFailure(threadID, turnID string) rpcMessage {
+	return rpcMessage{Method: "turn/completed", Params: map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": "failed", "error": map[string]any{"message": "Request blocked by cyber safety policy", "codexErrorInfo": "cyberPolicy"}}}}
+}
+
+func TestSupervisorCyberPolicyRecovery(t *testing.T) {
+	cwd := t.TempDir()
+	supervisor := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))
+	turnNumber := 0
+	proxy := &mockProxy{}
+	proxy.request = func(_ context.Context, method string, _ map[string]any) (any, error) {
+		if method == "thread/fork" {
+			return map[string]any{"thread": map[string]any{"id": "fork-1"}}, nil
+		}
+		if method == "turn/start" {
+			turnNumber++
+			return map[string]any{"turn": map[string]any{"id": fmt.Sprintf("recovery-%d", turnNumber), "status": "inProgress"}}, nil
+		}
+		return map[string]any{}, nil
+	}
+	supervisor.proxy = proxy
+
+	for index, failure := range []rpcMessage{cyberFailure("thread-1", "original"), cyberFailure("thread-1", "recovery-1"), cyberFailure("thread-1", "recovery-2")} {
+		supervisor.handleServerMessage(failure)
+		want := fmt.Sprintf("recovery-%d", index+1)
+		waitFor(t, func() bool {
+			return supervisor.stateSnapshot().ActiveTurnID == want && !supervisor.isSubmittingResume()
+		})
+	}
+	wantMethods := []string{"thread/resume", "turn/start", "thread/resume", "turn/start", "thread/fork", "turn/start"}
+	if got := proxy.methods(); fmt.Sprint(got) != fmt.Sprint(wantMethods) {
+		t.Fatalf("requests = %v, want %v", got, wantMethods)
+	}
+	proxy.mu.Lock()
+	prompts := []string{}
+	for _, record := range proxy.records {
+		if record.Method == "turn/start" {
+			input := record.Params["input"].([]any)[0].(map[string]any)
+			prompts = append(prompts, input["text"].(string))
+		}
+	}
+	proxy.mu.Unlock()
+	if fmt.Sprint(prompts) != fmt.Sprint([]string{"continue", "继续", "continue"}) {
+		t.Fatalf("prompts = %v", prompts)
+	}
+	if state := supervisor.stateSnapshot(); state.CurrentThreadID != "fork-1" {
+		t.Fatalf("fork was not selected: %#v", state)
+	}
+	supervisor.handleServerMessage(cyberFailure("fork-1", "recovery-3"))
+	waitFor(t, func() bool {
+		return supervisor.stateSnapshot().Phase == "needs-attention" && !supervisor.isSubmittingResume()
+	})
+	if len(proxy.methods()) != 6 || !strings.Contains(supervisor.stateSnapshot().LastError, "exhausted after 3 attempts") {
+		t.Fatalf("unexpected exhausted state: %#v", supervisor.stateSnapshot())
+	}
+}
+
+func TestSupervisorStallRecovery(t *testing.T) {
+	cwd := t.TempDir()
+	supervisor := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))
+	proxy := &mockProxy{}
+	proxy.request = func(_ context.Context, method string, _ map[string]any) (any, error) {
+		switch method {
+		case "thread/read":
+			return map[string]any{"thread": map[string]any{"id": "thread-1", "status": map[string]any{"type": "active", "activeFlags": []any{}}}}, nil
+		case "turn/interrupt":
+			supervisor.handleServerMessage(rpcMessage{Method: "turn/completed", Params: map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "interrupted"}}})
+			return map[string]any{}, nil
+		case "turn/start":
+			return map[string]any{"turn": map[string]any{"id": "turn-2", "status": "inProgress"}}, nil
+		default:
+			return map[string]any{}, nil
+		}
+	}
+	supervisor.proxy = proxy
+	start := time.Now()
+	supervisor.handleServerMessage(rpcMessage{Method: "turn/started", Params: map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "inProgress"}}})
+	supervisor.evaluateStall(start.Add(100 * time.Millisecond))
+	if supervisor.stateSnapshot().Phase != "suspected-stall" {
+		t.Fatal("turn was not marked as suspected")
+	}
+	supervisor.evaluateStall(start.Add(150 * time.Millisecond))
+	waitFor(t, func() bool {
+		return supervisor.stateSnapshot().ActiveTurnID == "turn-2" && !supervisor.isSubmittingResume() && !supervisor.isStallCheckInFlight()
+	})
+	want := []string{"thread/read", "turn/interrupt", "thread/resume", "turn/start"}
+	if got := proxy.methods(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("requests = %v, want %v", got, want)
+	}
+	state := supervisor.stateSnapshot()
+	if state.Phase != "running" || state.StallRecoveryCount != 1 {
+		t.Fatalf("unexpected recovered state: %#v", state)
+	}
+}
+
+func TestSupervisorDoesNotResumeManualInterrupt(t *testing.T) {
+	cwd := t.TempDir()
+	supervisor := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))
+	proxy := &mockProxy{request: func(context.Context, string, map[string]any) (any, error) { return map[string]any{}, nil }}
+	supervisor.proxy = proxy
+	supervisor.handleServerMessage(rpcMessage{Method: "turn/started", Params: map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "inProgress"}}})
+	supervisor.handleServerMessage(rpcMessage{Method: "turn/completed", Params: map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "interrupted"}}})
+	if len(proxy.methods()) != 0 || supervisor.stateSnapshot().Phase != "idle" {
+		t.Fatalf("manual interruption was recovered: %v %#v", proxy.methods(), supervisor.stateSnapshot())
+	}
+}
+
+func waitFor(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
+}
+
+func (s *supervisor) isSubmittingResume() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.submittingResume
+}
+
+func (s *supervisor) isStallCheckInFlight() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stallCheckInFlight
+}

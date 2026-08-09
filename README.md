@@ -1,74 +1,74 @@
-# Codex Provider Supervisor
+# Codexdog
 
-This wrapper keeps the normal Codex terminal UI, watches structured app-server turn events, resumes an interrupted thread after a custom model provider recovers, and can detect active turns that stop producing activity.
+Codexdog is a native Go wrapper around the Codex CLI. It keeps the normal Codex terminal UI, observes structured app-server events, probes a custom provider after transient failures, and resumes the interrupted thread after the provider recovers. An optional stalled-turn watchdog detects active turns that stop producing activity, interrupts them, and sends `continue`.
 
-It reacts to provider/network failures and performs a bounded recovery sequence for `cyberPolicy` failures. Authentication, configuration, sandbox, context-window, approval, usage-limit, and user-interruption failures are left for the user.
+It preserves the Codex process. Recovery is for a stopped task/turn, not for restarting the Codex CLI process.
 
-## Install
+## Requirements
 
-Requirements:
+- Go 1.24 or newer to build
+- Codex CLI with `app-server` and `--remote` support (tested with 0.146.0)
+- A working Codex login and provider configuration
 
-- Node.js 20 or newer
-- Codex CLI with `app-server` and `--remote` support
-- An existing working Codex login and provider configuration
+## Build and install
 
 ```powershell
-npm install
-npm run build
+go build -o codexdog.exe .
 ```
+
+The resulting binary is self-contained. Put it on `PATH` alongside the Codex executable. Cross-compile binaries for another computer with, for example:
+
+```powershell
+$env:GOOS = "linux"; $env:GOARCH = "amd64"; go build -o codexdog .
+```
+
+The other computer needs Codex CLI and its login/configuration, but does not need Go.
 
 ## Run
 
 ```powershell
-node dist/cli.js start -C D:\path\to\repo
+codexdog start -C D:\path\to\repo
 ```
 
-The command starts a localhost-only Codex app-server, a local observing proxy, and the standard Codex TUI. Run it from an interactive terminal, use Codex normally, and keep that terminal open while the task runs.
-
-Pass Codex configuration overrides with repeatable `-c` flags. Put other TUI arguments after `--`:
+Pass Codex configuration overrides with repeatable `-c` flags. Put all other Codex TUI arguments after `--`:
 
 ```powershell
-node dist/cli.js start -C . -c 'model="gpt-5.6-sol"' -- --sandbox workspace-write
-```
-
-Enable stalled-turn recovery with a conservative ten-minute silence timeout:
-
-```powershell
-node dist/cli.js start -C . --stall-timeout-ms 600000 -- --sandbox workspace-write
+codexdog start -C . -c 'model="gpt-5.6-sol"' -- resume -s danger-full-access
 ```
 
 Check or stop a supervisor from another terminal:
 
 ```powershell
-node dist/cli.js status -C .
-node dist/cli.js status -C . --json
-node dist/cli.js stop -C .
+codexdog status -C .
+codexdog status -C . --json
+codexdog stop -C .
 ```
 
-State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervisor` by default. Set `CODEX_SUPERVISOR_HOME` or pass `--state-dir` to change this.
+State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervisor` on Windows and `$HOME/.local/state/codex-supervisor` elsewhere. Set `CODEXDOG_HOME`, `CODEX_SUPERVISOR_HOME`, or pass `--state-dir` to change this.
 
 ## Recovery behavior
 
 1. Observe `error` and terminal `turn/completed` events from the same connection used by the TUI.
-2. Recover only connection, stream, timeout, overload, rate-limit, and upstream `5xx` failures.
-3. Probe through a dedicated ephemeral Codex thread so the canary uses the same provider and authentication.
+2. Recover only connection, stream, timeout, overload, rate-limit, and upstream `5xx` failures. Authentication, configuration, sandbox, context-window, approval, usage-limit, and unknown failures require attention.
+3. Probe through a dedicated ephemeral Codex thread using the same provider and authentication. The canary is instructed not to call tools.
 4. Require two successful canaries by default.
-5. Start one continuation turn on the exact failed thread.
+5. Continue the exact failed thread and workspace.
 6. For `cyberPolicy`, retry the same thread with `continue`, retry it with `继续`, then fork through the failed turn and try `continue` once on the new thread. These retries do not wait for provider probes.
-7. When the stalled-turn watchdog is enabled, mark a silent turn as suspected, wait through a confirmation window, verify that the thread is still active, interrupt it, and send `continue` only after Codex reports the old turn as interrupted.
-8. Stop after five consecutive automatic resumptions, after the forked cyber-policy retry also fails, after two consecutive stalled-turn resumptions, or on any other permanent failure.
-
-The provider probe never reads Codex credentials and is instructed not to call tools. A successful canary consumes a very small model request. Configure `--health-url` to avoid canaries while a provider's cheap health endpoint is still failing.
+7. Stop after five automatic resumptions, after the forked cyber-policy retry fails, or after a permanent failure.
 
 The continuation is semantic: Codex reuses the saved thread and current workspace, but cannot resume at the exact interrupted output token.
 
 ## Stalled-turn watchdog
 
-The watchdog is disabled by default. Set `--stall-timeout-ms` to a non-zero value to enable it. Activity includes turn and item lifecycle events, streamed agent or reasoning output, command output, plan and diff updates, hooks, and token-usage updates.
+The watchdog is disabled by default. Enable it with a non-zero timeout:
 
-The normal stall timeout is paused while Codex is waiting for approval or user input, performing account verification or safety buffering, or running a command, MCP call, web search, collaboration call, hook, file change, image view, or context compaction. Quiet active tools are never interrupted by default. Set `--tool-stall-timeout-ms` only when you also want a separate upper bound for those operations.
+```powershell
+codexdog start -C . --stall-timeout-ms 600000 -- --sandbox workspace-write
+```
 
-A suspected turn must remain silent for `--stall-confirm-ms` and still report an active thread status before it is interrupted. Any matching activity during confirmation cancels recovery. User-initiated Esc interruptions remain manual and are never automatically continued.
+Activity includes turn and item lifecycle events, streamed agent or reasoning output, command output, plan and diff updates, hooks, and token-usage updates. The normal timeout is paused while Codex waits for approval/user input, performs verification or safety buffering, or runs a command/tool. Quiet active tools are never interrupted unless `--tool-stall-timeout-ms` is also set.
+
+A suspected turn must remain silent through `--stall-confirm-ms` and still report an active thread status before it is interrupted. User Esc/Ctrl+C interruptions remain manual and are never automatically continued. At most two stalled-turn resumptions are attempted by default.
 
 ## Configuration
 
@@ -86,18 +86,18 @@ A suspected turn must remain silent for `--stall-confirm-ms` and still report an
 --probe-model model-name
 ```
 
-Provider configuration belongs in the user-level Codex config. Current Codex versions ignore provider redirects in project `.codex/config.toml` files.
+When `--health-url` is omitted, recovery uses the ephemeral Codex canary directly. The health URL is optional and should be a cheap endpoint for the custom provider; a successful endpoint check still requires the configured number of Codex canaries before resuming.
 
-## Protocol compatibility
+## Compatibility checks
 
-The implementation targets the generated app-server schema from Codex CLI `0.146.0`. Local WebSocket app-server transport is experimental in Codex. Run the test suite and an end-to-end canary after upgrading Codex:
+Run the unit tests, protocol smoke test, and optional provider canary after upgrading Codex:
 
 ```powershell
-npm test
-npm run check
-npm run smoke
-npm run canary
+go test ./...
+codexdog smoke
+codexdog canary
 ```
 
-`npm run smoke` initializes the installed app-server and proxy but does not start a model turn or consume provider tokens.
-`npm run canary` additionally sends one minimal request through the configured provider.
+`smoke` initializes the installed app-server and proxy, then creates and reads an ephemeral thread without consuming a model turn. `canary` additionally sends one minimal request through the configured provider.
+
+The protocol implementation targets the Codex CLI 0.146.0 app-server schema. Run `smoke` after upgrading Codex because app-server WebSocket transport is still experimental.
