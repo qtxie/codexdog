@@ -50,11 +50,13 @@ State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervis
 
 1. Observe `error` and terminal `turn/completed` events from the same connection used by the TUI.
 2. Recover only connection, stream, timeout, overload, rate-limit, and upstream `5xx` failures. Authentication, configuration, sandbox, context-window, approval, usage-limit, and unknown failures require attention.
-3. Probe through a dedicated ephemeral Codex thread using the same provider and authentication. The canary is instructed not to call tools.
-4. Require two successful canaries by default.
-5. Continue the exact failed thread and workspace.
-6. For `cyberPolicy`, retry the same thread with `continue`, retry it with `继续`, then fork through the failed turn and try `continue` once on the new thread. These retries do not wait for provider probes.
-7. Stop after five automatic resumptions, after the forked cyber-policy retry fails, or after a permanent failure.
+3. When Codex reports a transient error with `willRetry=false`, wait up to `--error-grace-ms` for the normal terminal event. Any continued activity restarts this grace period.
+4. If the terminal event is missing, read the thread status. A thread waiting for approval or user input is left alone. An active, non-waiting turn is interrupted; an already-idle thread proceeds directly to recovery.
+5. Probe through a dedicated ephemeral Codex thread using the same provider and authentication. The canary is instructed not to call tools.
+6. Require two successful canaries by default.
+7. Continue the exact failed thread and workspace.
+8. For `cyberPolicy`, retry the same thread with `continue`, retry it with `继续`, then fork through the failed turn and try `continue` once on the new thread. These retries do not wait for provider probes.
+9. Stop after five automatic resumptions, after the forked cyber-policy retry fails, or after a permanent failure.
 
 The continuation is semantic: Codex reuses the saved thread and current workspace, but cannot resume at the exact interrupted output token.
 
@@ -75,6 +77,7 @@ A suspected turn must remain silent through `--stall-confirm-ms` and still repor
 ```text
 --probe-timeout-ms 120000
 --probe-successes 2
+--error-grace-ms 5000
 --backoff-ms 2000,5000,10000,20000,30000,60000
 --max-auto-resumes 5
 --stall-timeout-ms 0

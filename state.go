@@ -34,6 +34,7 @@ type supervisorState struct {
 	StallPausedReason         string `json:"stallPausedReason,omitempty"`
 	NextProbeAt               string `json:"nextProbeAt,omitempty"`
 	LastError                 string `json:"lastError,omitempty"`
+	TerminalErrorSuspectedAt  string `json:"terminalErrorSuspectedAt,omitempty"`
 	UpdatedAt                 string `json:"updatedAt"`
 	StoppedReason             string `json:"stoppedReason,omitempty"`
 }

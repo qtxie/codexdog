@@ -78,6 +78,7 @@ func run(argv []string) (int, error) {
 			fmt.Printf("Last turn activity: %s\n", valueOrDash(state.LastTurnActivityAt))
 			fmt.Printf("Stall suspected: %s\n", valueOrDash(state.StallSuspectedAt))
 			fmt.Printf("Watchdog pause: %s\n", valueOrDash(state.StallPausedReason))
+			fmt.Printf("Terminal error suspected: %s\n", valueOrDash(state.TerminalErrorSuspectedAt))
 			fmt.Printf("Last error: %s\n", valueOrDash(state.LastError))
 			fmt.Printf("Updated: %s\n", state.UpdatedAt)
 		}
@@ -137,7 +138,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		stateRoot = filepath.Join(base, "codex-supervisor")
 	}
 	options := supervisorOptions{
-		CWD: cwd, CodexPath: "codex", ProbeTimeout: 120 * time.Second,
+		CWD: cwd, CodexPath: "codex", ProbeTimeout: 120 * time.Second, TerminalErrorGrace: 5 * time.Second,
 		ProbeSuccesses: 2, Backoff: append([]time.Duration(nil), defaultBackoff...), MaxAutoResumes: 5,
 		StallConfirm: 30 * time.Second, StallInterruptTimeout: 15 * time.Second, MaxStallResumes: 2,
 	}
@@ -211,6 +212,16 @@ func parseArguments(argv []string) (parsedArguments, error) {
 			if err != nil {
 				return parsedArguments{}, err
 			}
+		case "--error-grace-ms":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			parsed, err := positiveInteger(value, arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.TerminalErrorGrace = time.Duration(parsed) * time.Millisecond
 		case "--max-auto-resumes":
 			value, err := valueAfter(arg)
 			if err != nil {
@@ -347,6 +358,7 @@ Options:
   --probe-model MODEL         Optional model override for health canaries
   --probe-timeout-ms MS       Canary timeout (default: 120000)
   --probe-successes N         Successes required before resume (default: 2)
+  --error-grace-ms MS         Terminal-event grace period (default: 5000)
   --backoff-ms LIST           Comma-separated retry delays
   --max-auto-resumes N        Consecutive automatic resume limit (default: 5)
   --stall-timeout-ms MS       Silent-turn timeout; 0 disables it (default: 0)

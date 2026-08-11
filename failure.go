@@ -49,6 +49,11 @@ func classifyFailure(failure turnError) classifiedFailure {
 		if transientStringCodes[code] {
 			return classifiedFailure{Disposition: "transient", Code: code, Message: message}
 		}
+		// "other" is a generic fallback. Preserve explicit permanent message
+		// signals, but allow clear transport/timeout text to refine it.
+		if code == "other" && !permanentMessage.MatchString(message) && transientMessage.MatchString(message) {
+			return classifiedFailure{Disposition: "transient", Code: "messageMatch", Message: message}
+		}
 		if permanentStringCodes[code] {
 			return classifiedFailure{Disposition: "permanent", Code: code, Message: message}
 		}
@@ -64,6 +69,9 @@ func classifyFailure(failure turnError) classifiedFailure {
 				if number, ok := readNumber(details["httpStatusCode"]); ok {
 					status = int(number)
 				}
+			}
+			if code == "other" && !permanentMessage.MatchString(message) && transientMessage.MatchString(message) {
+				return classifiedFailure{Disposition: "transient", Code: "messageMatch", Message: message}
 			}
 			transient := transientObjectCodes[code] && (status == 0 || status == 408 || status == 425 || status == 429 || status >= 500)
 			disposition := "permanent"

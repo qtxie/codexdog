@@ -30,6 +30,9 @@ func TestClassifyFailure(t *testing.T) {
 		{"string auth", turnError{Message: "login expired", CodexErrorInfo: "unauthorized"}, "permanent", "unauthorized", 0},
 		{"overload", turnError{Message: "overloaded", CodexErrorInfo: "serverOverloaded"}, "transient", "serverOverloaded", 0},
 		{"timeout message", turnError{Message: "request timed out"}, "transient", "messageMatch", 0},
+		{"generic other timeout", turnError{Message: "stream disconnected before completion: idle timeout waiting for SSE", CodexErrorInfo: "other"}, "transient", "messageMatch", 0},
+		{"generic object other timeout", turnError{Message: "idle timeout waiting for SSE", CodexErrorInfo: map[string]any{"other": map[string]any{}}}, "transient", "messageMatch", 0},
+		{"permanent text overrides other timeout", turnError{Message: "unauthorized after connection timeout", CodexErrorInfo: "other"}, "permanent", "other", 0},
 		{"unknown", turnError{Message: "unexpected model response"}, "permanent", "unclassified", 0},
 	}
 	for _, test := range tests {

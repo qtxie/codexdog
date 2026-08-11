@@ -12,6 +12,7 @@ func TestParseArgumentsPreservesCodexArguments(t *testing.T) {
 		"-c", `model="gpt-5.6-sol"`,
 		"-c", `model_reasoning_effort="high"`,
 		"--health-url", "https://provider.example/health",
+		"--error-grace-ms", "7000",
 		"--stall-timeout-ms", "600000",
 		"--", "resume", "-s", "danger-full-access",
 	})
@@ -26,6 +27,9 @@ func TestParseArgumentsPreservesCodexArguments(t *testing.T) {
 	}
 	if args.Options.HealthURL != "https://provider.example/health" || args.Options.StallTimeout != 10*time.Minute {
 		t.Fatalf("options were not parsed: %#v", args.Options)
+	}
+	if args.Options.TerminalErrorGrace != 7*time.Second {
+		t.Fatalf("terminal error grace = %s", args.Options.TerminalErrorGrace)
 	}
 }
 

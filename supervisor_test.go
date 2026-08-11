@@ -38,7 +38,7 @@ func (m *mockProxy) methods() []string {
 }
 
 func testSupervisorOptions(cwd string) supervisorOptions {
-	return supervisorOptions{CWD: cwd, CodexPath: "codex", ProbeTimeout: 30 * time.Second, ProbeSuccesses: 2, Backoff: []time.Duration{time.Second}, MaxAutoResumes: 5, StallTimeout: 100 * time.Millisecond, StallConfirm: 50 * time.Millisecond, StallInterruptTimeout: time.Second, MaxStallResumes: 2}
+	return supervisorOptions{CWD: cwd, CodexPath: "codex", ProbeTimeout: 30 * time.Second, TerminalErrorGrace: 20 * time.Millisecond, ProbeSuccesses: 2, Backoff: []time.Duration{time.Second}, MaxAutoResumes: 5, StallTimeout: 100 * time.Millisecond, StallConfirm: 50 * time.Millisecond, StallInterruptTimeout: time.Second, MaxStallResumes: 2}
 }
 
 func cyberFailure(threadID, turnID string) rpcMessage {
@@ -90,7 +90,8 @@ func TestSupervisorCyberPolicyRecovery(t *testing.T) {
 	}
 	supervisor.handleServerMessage(cyberFailure("fork-1", "recovery-3"))
 	waitFor(t, func() bool {
-		return supervisor.stateSnapshot().Phase == "needs-attention" && !supervisor.isSubmittingResume()
+		persisted, ok := supervisor.store.Read()
+		return supervisor.stateSnapshot().Phase == "needs-attention" && !supervisor.isSubmittingResume() && ok && persisted.Phase == "needs-attention"
 	})
 	if len(proxy.methods()) != 6 || !strings.Contains(supervisor.stateSnapshot().LastError, "exhausted after 3 attempts") {
 		t.Fatalf("unexpected exhausted state: %#v", supervisor.stateSnapshot())
@@ -115,8 +116,8 @@ func TestSupervisorStallRecovery(t *testing.T) {
 		}
 	}
 	supervisor.proxy = proxy
-	start := time.Now()
 	supervisor.handleServerMessage(rpcMessage{Method: "turn/started", Params: map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "inProgress"}}})
+	start := supervisor.watchdog.Snapshot().LastActivityAt
 	supervisor.evaluateStall(start.Add(100 * time.Millisecond))
 	if supervisor.stateSnapshot().Phase != "suspected-stall" {
 		t.Fatal("turn was not marked as suspected")

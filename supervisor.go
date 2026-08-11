@@ -26,6 +26,7 @@ type supervisorOptions struct {
 	HealthURL             string
 	ProbeModel            string
 	ProbeTimeout          time.Duration
+	TerminalErrorGrace    time.Duration
 	ProbeSuccesses        int
 	Backoff               []time.Duration
 	MaxAutoResumes        int
@@ -40,6 +41,13 @@ type recoveryContext struct {
 	ThreadID     string
 	FailedTurnID string
 	Failure      classifiedFailure
+}
+
+type pendingTerminalError struct {
+	Recovery     recoveryContext
+	Generation   uint64
+	Timer        *time.Timer
+	Interrupting bool
 }
 
 type threadRuntimeStatus struct {
@@ -82,6 +90,7 @@ type supervisor struct {
 	activityTimer      *time.Timer
 
 	turnErrors               map[string]turnError
+	pendingTerminalErrors    map[string]*pendingTerminalError
 	handledTurns             map[string]bool
 	cyberPolicyAttempts      map[string]int
 	watchdogInterruptedTurns map[string]bool
@@ -93,6 +102,9 @@ type supervisor struct {
 }
 
 func newSupervisor(options supervisorOptions, store *stateStore) *supervisor {
+	if options.TerminalErrorGrace <= 0 {
+		options.TerminalErrorGrace = 5 * time.Second
+	}
 	return &supervisor{
 		options:                  options,
 		store:                    store,
@@ -100,6 +112,7 @@ func newSupervisor(options supervisorOptions, store *stateStore) *supervisor {
 		watchdog:                 newStallWatchdog(stallWatchdogOptions{StallTimeout: options.StallTimeout, ConfirmTimeout: options.StallConfirm, ToolStallTimeout: options.ToolStallTimeout}),
 		state:                    supervisorState{Version: 1, PID: os.Getpid(), CWD: options.CWD, Phase: "starting", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)},
 		turnErrors:               map[string]turnError{},
+		pendingTerminalErrors:    map[string]*pendingTerminalError{},
 		handledTurns:             map[string]bool{},
 		cyberPolicyAttempts:      map[string]int{},
 		watchdogInterruptedTurns: map[string]bool{},
@@ -272,6 +285,15 @@ func (s *supervisor) handleClientMessage(message rpcMessage) {
 		s.mu.Lock()
 		s.stallGeneration++
 		delete(s.watchdogInterruptedTurns, turnID)
+		if pending := s.pendingTerminalErrors[turnID]; pending != nil {
+			if pending.Timer != nil {
+				pending.Timer.Stop()
+			}
+			delete(s.pendingTerminalErrors, turnID)
+		}
+		if len(s.pendingTerminalErrors) == 0 {
+			s.state.TerminalErrorSuspectedAt = ""
+		}
 		waiter := s.turnTerminalWaiters[turnID]
 		delete(s.turnTerminalWaiters, turnID)
 		s.mu.Unlock()
@@ -280,7 +302,7 @@ func (s *supervisor) handleClientMessage(message rpcMessage) {
 		}
 		s.watchdog.CancelRecovery()
 		s.syncStallState()
-		s.logger.Log(fmt.Sprintf("User requested an interrupt%s; stall recovery cancelled", optionalID(turnID)))
+		s.logger.Log(fmt.Sprintf("User requested an interrupt%s; automatic recovery cancelled", optionalID(turnID)))
 		return
 	}
 	if message.Method != "turn/start" {
@@ -295,6 +317,17 @@ func (s *supervisor) handleClientMessage(message rpcMessage) {
 	submitting := s.submittingResume
 	if !submitting && threadID != "" {
 		delete(s.cyberPolicyAttempts, threadID)
+		for turnID, pending := range s.pendingTerminalErrors {
+			if pending.Recovery.ThreadID == threadID {
+				if pending.Timer != nil {
+					pending.Timer.Stop()
+				}
+				delete(s.pendingTerminalErrors, turnID)
+			}
+		}
+		if len(s.pendingTerminalErrors) == 0 {
+			s.state.TerminalErrorSuspectedAt = ""
+		}
 		s.stallGeneration++
 		s.state.StallRecoveryCount = 0
 		clearStallState(&s.state)
@@ -330,6 +363,9 @@ func (s *supervisor) handleServerMessage(message rpcMessage) {
 		s.mu.Unlock()
 		s.scheduleActivityPersist()
 	}
+	if message.Method != "error" && message.Method != "turn/completed" {
+		s.deferPendingTerminalError(message)
+	}
 
 	switch message.Method {
 	case "thread/started":
@@ -341,19 +377,128 @@ func (s *supervisor) handleServerMessage(message rpcMessage) {
 	case "thread/status/changed":
 		s.handleThreadStatus(message.Params)
 	case "error":
-		turnID, idOK := readString(message.Params["turnId"])
-		parsed, errorOK := readTurnError(message.Params["error"])
-		if idOK && errorOK {
-			willRetry, _ := readBool(message.Params["willRetry"])
-			s.mu.Lock()
-			s.turnErrors[turnID] = parsed
-			s.mu.Unlock()
-			s.logger.Log(fmt.Sprintf("Turn %s error (willRetry=%t): %s", turnID, willRetry, parsed.Message))
-		}
+		s.handleTurnError(message.Params)
 	case "turn/started":
 		s.handleTurnStarted(message.Params)
 	case "turn/completed":
 		s.handleTurnCompleted(message.Params)
+	}
+}
+
+func (s *supervisor) handleTurnError(params map[string]any) {
+	threadID, threadOK := readString(params["threadId"])
+	turnID, turnOK := readString(params["turnId"])
+	parsed, errorOK := readTurnError(params["error"])
+	if !threadOK || !turnOK || !errorOK {
+		return
+	}
+	willRetry, _ := readBool(params["willRetry"])
+	failure := classifyFailure(parsed)
+	s.mu.Lock()
+	s.turnErrors[turnID] = parsed
+	s.mu.Unlock()
+	s.logger.Log(fmt.Sprintf("Turn %s error (willRetry=%t): %s", turnID, willRetry, parsed.Message))
+
+	if willRetry || failure.Disposition != "transient" {
+		if willRetry {
+			s.cancelPendingTerminalError(turnID)
+		}
+		return
+	}
+	s.schedulePendingTerminalError(recoveryContext{ThreadID: threadID, FailedTurnID: turnID, Failure: failure})
+}
+
+func (s *supervisor) schedulePendingTerminalError(recovery recoveryContext) {
+	s.mu.Lock()
+	if s.shuttingDown || s.handledTurns[recovery.FailedTurnID] {
+		s.mu.Unlock()
+		return
+	}
+	pending := s.pendingTerminalErrors[recovery.FailedTurnID]
+	if pending == nil {
+		pending = &pendingTerminalError{Recovery: recovery}
+		s.pendingTerminalErrors[recovery.FailedTurnID] = pending
+		s.state.TerminalErrorSuspectedAt = atomicTime(time.Now())
+	} else {
+		pending.Recovery = recovery
+	}
+	if !pending.Interrupting && pending.Timer == nil {
+		s.armPendingTerminalErrorLocked(pending)
+	}
+	if s.state.Phase != "needs-attention" && s.state.Phase != "stopped" {
+		s.state.Phase = "confirming-error"
+	}
+	s.state.LastError = sanitizeText(formatFailure(recovery.Failure))
+	s.mu.Unlock()
+	_ = s.persist()
+	s.logger.Log(fmt.Sprintf("Waiting %s for terminal event after transient error on turn %s", s.options.TerminalErrorGrace, recovery.FailedTurnID))
+}
+
+func (s *supervisor) armPendingTerminalErrorLocked(pending *pendingTerminalError) {
+	pending.Generation++
+	generation := pending.Generation
+	turnID := pending.Recovery.FailedTurnID
+	pending.Timer = time.AfterFunc(s.options.TerminalErrorGrace, func() {
+		s.reconcilePendingTerminalError(turnID, generation)
+	})
+}
+
+func (s *supervisor) deferPendingTerminalError(message rpcMessage) {
+	threadID, _ := readString(message.Params["threadId"])
+	turnID, _ := readString(message.Params["turnId"])
+	if turnID == "" {
+		if nested, ok := asObject(message.Params["turn"]); ok {
+			turnID, _ = readString(nested["id"])
+		}
+	}
+	s.mu.Lock()
+	deferred := false
+	for _, pending := range s.pendingTerminalErrors {
+		if s.state.Phase == "needs-attention" || s.state.Phase == "stopped" {
+			break
+		}
+		if pending.Interrupting || !terminalErrorMatchesMessage(pending.Recovery, threadID, turnID) {
+			continue
+		}
+		if pending.Timer != nil {
+			pending.Timer.Stop()
+			pending.Timer = nil
+		}
+		s.armPendingTerminalErrorLocked(pending)
+		deferred = true
+	}
+	s.mu.Unlock()
+	if deferred {
+		s.logger.Log("Turn activity deferred transient-error reconciliation")
+	}
+}
+
+func terminalErrorMatchesMessage(recovery recoveryContext, threadID, turnID string) bool {
+	if turnID != "" {
+		return turnID == recovery.FailedTurnID
+	}
+	return threadID != "" && threadID == recovery.ThreadID
+}
+
+func (s *supervisor) cancelPendingTerminalError(turnID string) {
+	s.mu.Lock()
+	pending := s.pendingTerminalErrors[turnID]
+	changed := pending != nil
+	if pending != nil {
+		if pending.Timer != nil {
+			pending.Timer.Stop()
+		}
+		delete(s.pendingTerminalErrors, turnID)
+	}
+	if len(s.pendingTerminalErrors) == 0 {
+		s.state.TerminalErrorSuspectedAt = ""
+		if s.state.Phase == "confirming-error" {
+			s.state.Phase = "running"
+		}
+	}
+	s.mu.Unlock()
+	if changed {
+		_ = s.persist()
 	}
 }
 
@@ -362,6 +507,19 @@ func (s *supervisor) handleTurnStarted(params map[string]any) {
 	parsed, ok := readTurn(params["turn"])
 	if threadID != "" && ok {
 		s.watchdog.StartTurn(threadID, parsed.ID, time.Now())
+		s.mu.Lock()
+		for turnID, pending := range s.pendingTerminalErrors {
+			if pending.Recovery.ThreadID == threadID && turnID != parsed.ID {
+				if pending.Timer != nil {
+					pending.Timer.Stop()
+				}
+				delete(s.pendingTerminalErrors, turnID)
+			}
+		}
+		if len(s.pendingTerminalErrors) == 0 {
+			s.state.TerminalErrorSuspectedAt = ""
+		}
+		s.mu.Unlock()
 	}
 	s.modifyState(func(state *supervisorState) {
 		if threadID != "" {
@@ -388,6 +546,16 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 		return
 	}
 	s.handledTurns[parsed.ID] = true
+	pendingError := s.pendingTerminalErrors[parsed.ID]
+	if pendingError != nil {
+		if pendingError.Timer != nil {
+			pendingError.Timer.Stop()
+		}
+		delete(s.pendingTerminalErrors, parsed.ID)
+	}
+	if len(s.pendingTerminalErrors) == 0 {
+		s.state.TerminalErrorSuspectedAt = ""
+	}
 	waiter := s.turnTerminalWaiters[parsed.ID]
 	delete(s.turnTerminalWaiters, parsed.ID)
 	wasWatchdog := s.watchdogInterruptedTurns[parsed.ID]
@@ -426,6 +594,13 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 		delete(s.cyberPolicyAttempts, threadID)
 		s.mu.Unlock()
 		s.cancelRecovery()
+		if pendingError != nil && pendingError.Interrupting {
+			s.modifyState(func(state *supervisorState) { state.Phase = "provider-down" })
+			_ = s.persist()
+			s.logger.Log("Transient-error interrupt completed for turn " + parsed.ID)
+			s.startRecovery(pendingError.Recovery)
+			return
+		}
 		if wasWatchdog {
 			if waiter != nil {
 				s.modifyState(func(state *supervisorState) { state.Phase = "resuming" })
@@ -492,6 +667,199 @@ func (s *supervisor) handleThreadStatus(params map[string]any) {
 	}
 }
 
+func (s *supervisor) reconcilePendingTerminalError(turnID string, generation uint64) {
+	s.mu.Lock()
+	pending := s.pendingTerminalErrors[turnID]
+	if pending == nil || pending.Generation != generation || pending.Interrupting || s.shuttingDown || s.handledTurns[turnID] || s.state.Phase == "needs-attention" || s.state.Phase == "stopped" {
+		s.mu.Unlock()
+		return
+	}
+	pending.Timer = nil
+	if s.submittingResume || s.recoveryCancel != nil || s.stallCheckInFlight {
+		s.armPendingTerminalErrorLocked(pending)
+		s.mu.Unlock()
+		return
+	}
+	if s.state.ActiveTurnID != "" && s.state.ActiveTurnID != turnID {
+		delete(s.pendingTerminalErrors, turnID)
+		if len(s.pendingTerminalErrors) == 0 {
+			s.state.TerminalErrorSuspectedAt = ""
+		}
+		s.mu.Unlock()
+		return
+	}
+	proxy := s.proxy
+	recovery := pending.Recovery
+	s.mu.Unlock()
+	if proxy == nil {
+		s.failPendingTerminalError(turnID, generation, errors.New("TUI proxy is unavailable"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.options.StallInterruptTimeout)
+	value, err := proxy.Request(ctx, "thread/read", map[string]any{"threadId": recovery.ThreadID, "includeTurns": false})
+	cancel()
+	if err != nil {
+		s.failPendingTerminalError(turnID, generation, fmt.Errorf("thread status check failed: %w", err))
+		return
+	}
+	s.mu.Lock()
+	pending = s.pendingTerminalErrors[turnID]
+	valid := pending != nil && pending.Generation == generation && !pending.Interrupting && !s.handledTurns[turnID]
+	s.mu.Unlock()
+	if !valid {
+		return
+	}
+	object, _ := asObject(value)
+	status, ok := readThreadRuntimeStatus(object["thread"])
+	if !ok {
+		s.failPendingTerminalError(turnID, generation, errors.New("Codex did not return the errored thread status"))
+		return
+	}
+	if status.Type != "active" {
+		s.recoverPendingErrorWithoutTerminal(turnID, generation, false)
+		return
+	}
+	waiting := []string{}
+	for _, flag := range status.ActiveFlags {
+		if flag == "waitingOnApproval" || flag == "waitingOnUserInput" {
+			waiting = append(waiting, flag)
+		}
+	}
+	if len(waiting) > 0 {
+		s.cancelPendingTerminalError(turnID)
+		s.watchdog.SetWaitingFlags(recovery.ThreadID, waiting, time.Now())
+		s.syncStallState()
+		s.modifyState(func(state *supervisorState) { state.Phase = "waiting-for-user" })
+		_ = s.persist()
+		s.logger.Log(fmt.Sprintf("Transient-error reconciliation deferred because thread %s is %s", recovery.ThreadID, waiting[0]))
+		return
+	}
+
+	waiter := make(chan string, 1)
+	s.mu.Lock()
+	pending = s.pendingTerminalErrors[turnID]
+	if pending == nil || pending.Generation != generation || pending.Interrupting || s.handledTurns[turnID] {
+		s.mu.Unlock()
+		return
+	}
+	pending.Interrupting = true
+	pending.Generation++
+	s.turnTerminalWaiters[turnID] = waiter
+	s.state.Phase = "interrupting-error"
+	s.mu.Unlock()
+	_ = s.persist()
+	s.logger.Log("Interrupting turn " + turnID + " after a transient error produced no terminal event")
+
+	ctx, cancel = context.WithTimeout(context.Background(), s.options.StallInterruptTimeout)
+	_, err = proxy.Request(ctx, "turn/interrupt", map[string]any{"threadId": recovery.ThreadID, "turnId": turnID})
+	cancel()
+	if err != nil {
+		s.mu.Lock()
+		delete(s.turnTerminalWaiters, turnID)
+		s.mu.Unlock()
+		s.failPendingTerminalError(turnID, 0, fmt.Errorf("turn interrupt failed: %w", err))
+		return
+	}
+	timer := time.NewTimer(s.options.StallInterruptTimeout)
+	defer timer.Stop()
+	select {
+	case status := <-waiter:
+		if status == "" {
+			return
+		}
+		// handleTurnCompleted owns recovery after a real terminal event.
+	case <-timer.C:
+		s.mu.Lock()
+		delete(s.turnTerminalWaiters, turnID)
+		s.mu.Unlock()
+		s.reconcileInterruptedTerminalError(turnID)
+	}
+}
+
+func (s *supervisor) reconcileInterruptedTerminalError(turnID string) {
+	s.mu.Lock()
+	pending := s.pendingTerminalErrors[turnID]
+	if pending == nil || !pending.Interrupting || s.handledTurns[turnID] || s.shuttingDown {
+		s.mu.Unlock()
+		return
+	}
+	proxy := s.proxy
+	recovery := pending.Recovery
+	s.mu.Unlock()
+	if proxy == nil {
+		s.failPendingTerminalError(turnID, 0, errors.New("TUI proxy is unavailable after turn interrupt"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.options.StallInterruptTimeout)
+	value, err := proxy.Request(ctx, "thread/read", map[string]any{"threadId": recovery.ThreadID, "includeTurns": false})
+	cancel()
+	if err != nil {
+		s.failPendingTerminalError(turnID, 0, fmt.Errorf("post-interrupt thread status check failed: %w", err))
+		return
+	}
+	s.mu.Lock()
+	pending = s.pendingTerminalErrors[turnID]
+	valid := pending != nil && pending.Interrupting && !s.handledTurns[turnID]
+	s.mu.Unlock()
+	if !valid {
+		return
+	}
+	object, _ := asObject(value)
+	status, ok := readThreadRuntimeStatus(object["thread"])
+	if !ok {
+		s.failPendingTerminalError(turnID, 0, errors.New("Codex did not return the interrupted thread status"))
+		return
+	}
+	if status.Type == "active" {
+		s.failPendingTerminalError(turnID, 0, fmt.Errorf("Codex still reports interrupted turn %s as active", turnID))
+		return
+	}
+	s.logger.Log("Interrupted turn " + turnID + " became terminal without turn/completed")
+	s.recoverPendingErrorWithoutTerminal(turnID, pending.Generation, true)
+}
+
+func (s *supervisor) recoverPendingErrorWithoutTerminal(turnID string, generation uint64, interrupting bool) {
+	s.mu.Lock()
+	pending := s.pendingTerminalErrors[turnID]
+	if pending == nil || pending.Generation != generation || pending.Interrupting != interrupting || s.handledTurns[turnID] {
+		s.mu.Unlock()
+		return
+	}
+	if pending.Timer != nil {
+		pending.Timer.Stop()
+	}
+	delete(s.pendingTerminalErrors, turnID)
+	s.handledTurns[turnID] = true
+	delete(s.turnErrors, turnID)
+	if s.state.ActiveTurnID == turnID {
+		s.state.ActiveTurnID = ""
+	}
+	s.state.LastFailedTurnID = turnID
+	s.state.LastError = sanitizeText(formatFailure(pending.Recovery.Failure))
+	if len(s.pendingTerminalErrors) == 0 {
+		s.state.TerminalErrorSuspectedAt = ""
+	}
+	recovery := pending.Recovery
+	s.mu.Unlock()
+	s.watchdog.CompleteTurn(turnID)
+	s.syncStallState()
+	_ = s.persist()
+	s.logger.Log("Recovering transient error for turn " + turnID + " after thread status became terminal without turn/completed")
+	s.startRecovery(recovery)
+}
+
+func (s *supervisor) failPendingTerminalError(turnID string, generation uint64, err error) {
+	s.mu.Lock()
+	pending := s.pendingTerminalErrors[turnID]
+	valid := pending != nil && (generation == 0 || pending.Generation == generation)
+	s.mu.Unlock()
+	if valid && !s.isShuttingDown() {
+		_ = s.setAttention("Transient-error reconciliation failed: " + err.Error())
+	}
+}
+
 func (s *supervisor) startStallWatchdog() {
 	if !s.watchdog.Enabled() {
 		return
@@ -514,7 +882,7 @@ func (s *supervisor) startStallWatchdog() {
 
 func (s *supervisor) evaluateStall(now time.Time) {
 	s.mu.Lock()
-	if s.shuttingDown || s.stallCheckInFlight || s.submittingResume || s.recoveryCancel != nil || s.state.Phase == "needs-attention" || s.state.Phase == "stopped" {
+	if s.shuttingDown || s.stallCheckInFlight || s.submittingResume || s.recoveryCancel != nil || len(s.pendingTerminalErrors) > 0 || s.state.Phase == "needs-attention" || s.state.Phase == "stopped" {
 		s.mu.Unlock()
 		return
 	}
@@ -1105,6 +1473,12 @@ func (s *supervisor) shutdown(reason string) {
 			s.activityTimer.Stop()
 			s.activityTimer = nil
 		}
+		for _, pending := range s.pendingTerminalErrors {
+			if pending.Timer != nil {
+				pending.Timer.Stop()
+			}
+		}
+		s.pendingTerminalErrors = map[string]*pendingTerminalError{}
 		waiters := s.turnTerminalWaiters
 		s.turnTerminalWaiters = map[string]chan string{}
 		s.watchdogInterruptedTurns = map[string]bool{}
@@ -1122,6 +1496,7 @@ func (s *supervisor) shutdown(reason string) {
 			state.StoppedReason = reason
 			state.ControlToken = ""
 			state.NextProbeAt = ""
+			state.TerminalErrorSuspectedAt = ""
 		})
 		_ = s.persist()
 		if s.probe != nil {
