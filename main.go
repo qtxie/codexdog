@@ -406,17 +406,16 @@ func runProtocolSmoke(options supervisorOptions, canary bool) (int, error) {
 	command := exec.Command(options.CodexPath, args...)
 	command.Dir = options.CWD
 	command.Stdout, command.Stderr = io.Discard, io.Discard
-	configureHiddenProcess(command)
-	if err := command.Start(); err != nil {
+	processes, err := newProcessTree()
+	if err != nil {
+		return 1, fmt.Errorf("initialize child process management: %w", err)
+	}
+	defer processes.Close()
+	if err := processes.Start(command, true); err != nil {
 		return 1, err
 	}
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
-	defer func() {
-		if command.Process != nil {
-			_ = command.Process.Kill()
-		}
-	}()
 	if err := waitForReady(port, done); err != nil {
 		return 1, err
 	}

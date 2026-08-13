@@ -4,6 +4,8 @@ Codexdog is a native Go wrapper around the Codex CLI. It keeps the normal Codex 
 
 It preserves the Codex process. Recovery is for a stopped task/turn, not for restarting the Codex CLI process.
 
+Codexdog owns only the app-server and TUI processes it starts and closes them on exit, without scanning for or terminating independent Codex sessions. On Windows, both processes are placed in a kill-on-close Job Object, so their descendants are also terminated if codexdog is closed unexpectedly.
+
 ## Requirements
 
 - Go 1.24 or newer to build
@@ -49,7 +51,7 @@ State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervis
 ## Recovery behavior
 
 1. Observe `error` and terminal `turn/completed` events from the same connection used by the TUI.
-2. Recover only connection, stream, timeout, overload, rate-limit, and upstream `5xx` failures. Authentication, configuration, sandbox, context-window, approval, usage-limit, and unknown failures require attention.
+2. Recover connection, stream, timeout, overload, rate-limit, upstream `5xx`, and exhausted Codex transport retries. Authentication, configuration, sandbox, context-window, approval, usage-limit, and unknown failures without prior retry evidence require attention.
 3. When Codex reports a transient error with `willRetry=false`, wait up to `--error-grace-ms` for the normal terminal event. Any continued activity restarts this grace period.
 4. If the terminal event is missing, read the thread status. A thread waiting for approval or user input is left alone. An active, non-waiting turn is interrupted; an already-idle thread proceeds directly to recovery.
 5. Probe through a dedicated ephemeral Codex thread using the same provider and authentication. The canary is instructed not to call tools.

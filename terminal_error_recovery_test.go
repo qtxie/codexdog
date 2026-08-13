@@ -184,3 +184,33 @@ func TestTerminalTransientErrorRecoversWhenInterruptTerminalEventIsMissing(t *te
 		t.Fatalf("requests = %v, want %v", got, want)
 	}
 }
+
+func TestRetryExhaustionStartsProviderRecovery(t *testing.T) {
+	s, proxy := newTerminalErrorHarness(t, "active")
+	for attempt := 1; attempt <= 5; attempt++ {
+		s.handleServerMessage(rpcMessage{Method: "error", Params: map[string]any{
+			"threadId": "thread-1", "turnId": "turn-1", "willRetry": true,
+			"error": map[string]any{
+				"message": fmt.Sprintf("Reconnecting... %d/5", attempt),
+				"codexErrorInfo": map[string]any{
+					"responseStreamDisconnected": map[string]any{"httpStatusCode": float64(200)},
+				},
+			},
+		}})
+	}
+	finalError := map[string]any{"message": "request failed after maximum retries", "codexErrorInfo": "other"}
+	s.handleServerMessage(rpcMessage{Method: "error", Params: map[string]any{
+		"threadId": "thread-1", "turnId": "turn-1", "willRetry": false, "error": finalError,
+	}})
+	s.handleServerMessage(rpcMessage{Method: "turn/completed", Params: map[string]any{
+		"threadId": "thread-1",
+		"turn":     map[string]any{"id": "turn-1", "status": "failed", "error": finalError},
+	}})
+	waitFor(t, func() bool {
+		return s.stateSnapshot().ActiveTurnID == "turn-2" && !s.isSubmittingResume()
+	})
+	want := []string{"thread/resume", "turn/start"}
+	if got := proxy.methods(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("requests = %v, want %v", got, want)
+	}
+}

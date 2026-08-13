@@ -12,6 +12,7 @@ type mockRPC struct {
 	mu           sync.Mutex
 	handler      notificationHandler
 	status       string
+	failure      *turnError
 	turnStarts   int
 	threadStarts int
 }
@@ -43,7 +44,11 @@ func (m *mockRPC) Request(_ context.Context, method string, _ map[string]any) (a
 		go func() {
 			turnValue := map[string]any{"id": turnID, "status": status}
 			if status == "failed" {
-				turnValue["error"] = map[string]any{"message": "provider unavailable", "codexErrorInfo": map[string]any{"httpConnectionFailed": map[string]any{"httpStatusCode": float64(503)}}}
+				failure := m.failure
+				if failure == nil {
+					failure = &turnError{Message: "provider unavailable", CodexErrorInfo: map[string]any{"httpConnectionFailed": map[string]any{"httpStatusCode": float64(503)}}}
+				}
+				turnValue["error"] = map[string]any{"message": failure.Message, "codexErrorInfo": failure.CodexErrorInfo}
 			}
 			if handler != nil {
 				handler(rpcMessage{Method: "turn/completed", Params: map[string]any{"threadId": "health-thread", "turn": turnValue}})
@@ -79,6 +84,21 @@ func TestProviderProbeClassifiesFailure(t *testing.T) {
 	defer probe.Dispose()
 	result := probe.Check(context.Background())
 	if result.Healthy || result.Failure == nil || result.Failure.Disposition != "transient" || result.Failure.HTTPStatus != 503 {
+		t.Fatalf("unexpected probe result: %#v", result)
+	}
+}
+
+func TestProviderProbeTreatsHTTP200StreamDisconnectAsTransient(t *testing.T) {
+	rpc := &mockRPC{status: "failed", failure: &turnError{
+		Message: "stream disconnected before completion",
+		CodexErrorInfo: map[string]any{
+			"responseTooManyFailedAttempts": map[string]any{"httpStatusCode": float64(200)},
+		},
+	}}
+	probe := newProviderProbe(rpc, providerProbeOptions{CWD: t.TempDir(), Timeout: time.Second})
+	defer probe.Dispose()
+	result := probe.Check(context.Background())
+	if result.Healthy || result.Failure == nil || result.Failure.Disposition != "transient" || result.Failure.Code != "responseTooManyFailedAttempts" || result.Failure.HTTPStatus != 200 {
 		t.Fatalf("unexpected probe result: %#v", result)
 	}
 }

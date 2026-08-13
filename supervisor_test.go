@@ -38,7 +38,7 @@ func (m *mockProxy) methods() []string {
 }
 
 func testSupervisorOptions(cwd string) supervisorOptions {
-	return supervisorOptions{CWD: cwd, CodexPath: "codex", ProbeTimeout: 30 * time.Second, TerminalErrorGrace: 20 * time.Millisecond, ProbeSuccesses: 2, Backoff: []time.Duration{time.Second}, MaxAutoResumes: 5, StallTimeout: 100 * time.Millisecond, StallConfirm: 50 * time.Millisecond, StallInterruptTimeout: time.Second, MaxStallResumes: 2}
+	return supervisorOptions{CWD: cwd, CodexPath: "codex", ProbeTimeout: 30 * time.Second, TerminalErrorGrace: 100 * time.Millisecond, ProbeSuccesses: 2, Backoff: []time.Duration{time.Second}, MaxAutoResumes: 5, StallTimeout: 100 * time.Millisecond, StallConfirm: 50 * time.Millisecond, StallInterruptTimeout: time.Second, MaxStallResumes: 2}
 }
 
 func cyberFailure(threadID, turnID string) rpcMessage {

@@ -79,6 +79,7 @@ type supervisor struct {
 	rpc          *jsonRPCClient
 	probe        *providerProbe
 	control      *controlServer
+	processes    *processTree
 	shuttingDown bool
 
 	recoveryCancel     context.CancelFunc
@@ -90,6 +91,7 @@ type supervisor struct {
 	activityTimer      *time.Timer
 
 	turnErrors               map[string]turnError
+	turnHadRetryableError    map[string]bool
 	pendingTerminalErrors    map[string]*pendingTerminalError
 	handledTurns             map[string]bool
 	cyberPolicyAttempts      map[string]int
@@ -112,6 +114,7 @@ func newSupervisor(options supervisorOptions, store *stateStore) *supervisor {
 		watchdog:                 newStallWatchdog(stallWatchdogOptions{StallTimeout: options.StallTimeout, ConfirmTimeout: options.StallConfirm, ToolStallTimeout: options.ToolStallTimeout}),
 		state:                    supervisorState{Version: 1, PID: os.Getpid(), CWD: options.CWD, Phase: "starting", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)},
 		turnErrors:               map[string]turnError{},
+		turnHadRetryableError:    map[string]bool{},
 		pendingTerminalErrors:    map[string]*pendingTerminalError{},
 		handledTurns:             map[string]bool{},
 		cyberPolicyAttempts:      map[string]int{},
@@ -134,6 +137,13 @@ func (s *supervisor) Run() (int, error) {
 	}
 	s.logger.Log("Starting supervisor in " + s.options.CWD)
 	go s.eventLoop()
+	processes, err := newProcessTree()
+	if err != nil {
+		return s.startupFailure(fmt.Errorf("initialize child process management: %w", err))
+	}
+	s.mu.Lock()
+	s.processes = processes
+	s.mu.Unlock()
 
 	appPort, err := getFreePort()
 	if err != nil {
@@ -227,8 +237,13 @@ func (s *supervisor) spawnAppServer(url string) (<-chan error, error) {
 	command.Stdin = nil
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
-	configureHiddenProcess(command)
-	if err := command.Start(); err != nil {
+	s.mu.Lock()
+	processes := s.processes
+	s.mu.Unlock()
+	if processes == nil {
+		return nil, errors.New("child process management is unavailable")
+	}
+	if err := processes.Start(command, true); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -252,9 +267,13 @@ func (s *supervisor) spawnTUI(proxyURL string) error {
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	s.mu.Lock()
+	processes := s.processes
 	s.tuiCmd = command
 	s.mu.Unlock()
-	return command.Start()
+	if processes == nil {
+		return errors.New("child process management is unavailable")
+	}
+	return processes.Start(command, false)
 }
 
 func (s *supervisor) enqueue(client bool, message rpcMessage) {
@@ -396,8 +415,15 @@ func (s *supervisor) handleTurnError(params map[string]any) {
 	failure := classifyFailure(parsed)
 	s.mu.Lock()
 	s.turnErrors[turnID] = parsed
+	if willRetry {
+		s.turnHadRetryableError[turnID] = true
+	}
+	hadRetryableError := s.turnHadRetryableError[turnID]
 	s.mu.Unlock()
-	s.logger.Log(fmt.Sprintf("Turn %s error (willRetry=%t): %s", turnID, willRetry, parsed.Message))
+	if !willRetry {
+		failure = classifyFailureAfterRetries(parsed, hadRetryableError)
+	}
+	s.logger.Log(fmt.Sprintf("Turn %s error (willRetry=%t, disposition=%s, code=%s): %s", turnID, willRetry, failure.Disposition, failure.Code, parsed.Message))
 
 	if willRetry || failure.Disposition != "transient" {
 		if willRetry {
@@ -562,6 +588,8 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 	delete(s.watchdogInterruptedTurns, parsed.ID)
 	storedError, hasStoredError := s.turnErrors[parsed.ID]
 	delete(s.turnErrors, parsed.ID)
+	hadRetryableError := s.turnHadRetryableError[parsed.ID]
+	delete(s.turnHadRetryableError, parsed.ID)
 	s.state.CurrentThreadID = threadID
 	s.state.ActiveTurnID = ""
 	s.mu.Unlock()
@@ -629,7 +657,7 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 	} else if hasStoredError {
 		failureError = storedError
 	}
-	failure := classifyFailure(failureError)
+	failure := classifyFailureAfterRetries(failureError, hadRetryableError)
 	s.modifyState(func(state *supervisorState) {
 		state.LastFailedTurnID = parsed.ID
 		state.LastError = sanitizeText(formatFailure(failure))
@@ -833,6 +861,7 @@ func (s *supervisor) recoverPendingErrorWithoutTerminal(turnID string, generatio
 	delete(s.pendingTerminalErrors, turnID)
 	s.handledTurns[turnID] = true
 	delete(s.turnErrors, turnID)
+	delete(s.turnHadRetryableError, turnID)
 	if s.state.ActiveTurnID == turnID {
 		s.state.ActiveTurnID = ""
 	}
@@ -1482,6 +1511,7 @@ func (s *supervisor) shutdown(reason string) {
 		waiters := s.turnTerminalWaiters
 		s.turnTerminalWaiters = map[string]chan string{}
 		s.watchdogInterruptedTurns = map[string]bool{}
+		processes := s.processes
 		tui := s.tuiCmd
 		app := s.appCmd
 		s.mu.Unlock()
@@ -1508,11 +1538,17 @@ func (s *supervisor) shutdown(reason string) {
 		if s.proxyServer != nil {
 			_ = s.proxyServer.Close()
 		}
-		if tui != nil && tui.Process != nil {
-			_ = tui.Process.Kill()
-		}
-		if app != nil && app.Process != nil {
-			_ = app.Process.Kill()
+		if processes != nil {
+			if err := processes.Close(); err != nil {
+				s.logger.Log("Failed to close child process tree: " + err.Error())
+			}
+		} else {
+			if tui != nil && tui.Process != nil {
+				_ = tui.Process.Kill()
+			}
+			if app != nil && app.Process != nil {
+				_ = app.Process.Kill()
+			}
 		}
 		if s.control != nil {
 			_ = s.control.Close()

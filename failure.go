@@ -45,13 +45,14 @@ func classifyFailure(failure turnError) classifiedFailure {
 	if message == "" {
 		message = "Codex turn failed"
 	}
+	signalText := failureSignalText(failure, message)
 	if code, ok := failure.CodexErrorInfo.(string); ok {
 		if transientStringCodes[code] {
 			return classifiedFailure{Disposition: "transient", Code: code, Message: message}
 		}
 		// "other" is a generic fallback. Preserve explicit permanent message
 		// signals, but allow clear transport/timeout text to refine it.
-		if code == "other" && !permanentMessage.MatchString(message) && transientMessage.MatchString(message) {
+		if code == "other" && !permanentMessage.MatchString(signalText) && transientMessage.MatchString(signalText) {
 			return classifiedFailure{Disposition: "transient", Code: "messageMatch", Message: message}
 		}
 		if permanentStringCodes[code] {
@@ -70,10 +71,10 @@ func classifyFailure(failure turnError) classifiedFailure {
 					status = int(number)
 				}
 			}
-			if code == "other" && !permanentMessage.MatchString(message) && transientMessage.MatchString(message) {
+			if code == "other" && !permanentMessage.MatchString(signalText) && transientMessage.MatchString(signalText) {
 				return classifiedFailure{Disposition: "transient", Code: "messageMatch", Message: message}
 			}
-			transient := transientObjectCodes[code] && (status == 0 || status == 408 || status == 425 || status == 429 || status >= 500)
+			transient := transientObjectCodes[code] && isTransientTransportStatus(status)
 			disposition := "permanent"
 			if transient {
 				disposition = "transient"
@@ -81,13 +82,62 @@ func classifyFailure(failure turnError) classifiedFailure {
 			return classifiedFailure{Disposition: disposition, Code: code, HTTPStatus: status, Message: message}
 		}
 	}
-	if permanentMessage.MatchString(message) {
+	if permanentMessage.MatchString(signalText) {
 		return classifiedFailure{Disposition: "permanent", Code: "messageMatch", Message: message}
 	}
-	if transientMessage.MatchString(message) {
+	if transientMessage.MatchString(signalText) {
 		return classifiedFailure{Disposition: "transient", Code: "messageMatch", Message: message}
 	}
 	return classifiedFailure{Disposition: "permanent", Code: "unclassified", Message: message}
+}
+
+func classifyFailureAfterRetries(failure turnError, hadRetryableError bool) classifiedFailure {
+	classified := classifyFailure(failure)
+	if !hadRetryableError || classified.Disposition == "transient" || hasExplicitPermanentSignal(failure) {
+		return classified
+	}
+	return classifiedFailure{Disposition: "transient", Code: "retryExhausted", HTTPStatus: classified.HTTPStatus, Message: classified.Message}
+}
+
+func failureSignalText(failure turnError, message string) string {
+	if failure.AdditionalDetails == nil || *failure.AdditionalDetails == "" {
+		return message
+	}
+	return message + " " + *failure.AdditionalDetails
+}
+
+func isTransientTransportStatus(status int) bool {
+	return status == 0 || status >= 200 && status < 300 || status == 408 || status == 425 || status == 429 || status >= 500
+}
+
+func hasExplicitPermanentSignal(failure turnError) bool {
+	message := failure.Message
+	if message == "" {
+		message = "Codex turn failed"
+	}
+	if permanentMessage.MatchString(failureSignalText(failure, message)) {
+		return true
+	}
+	if code, ok := failure.CodexErrorInfo.(string); ok {
+		return code != "other" && permanentStringCodes[code]
+	}
+	if info, ok := asObject(failure.CodexErrorInfo); ok {
+		for code, value := range info {
+			if code != "other" && permanentStringCodes[code] {
+				return true
+			}
+			if !transientObjectCodes[code] {
+				continue
+			}
+			if details, ok := asObject(value); ok {
+				if number, ok := readNumber(details["httpStatusCode"]); ok {
+					status := int(number)
+					return status >= 400 && status < 500 && status != 408 && status != 425 && status != 429
+				}
+			}
+		}
+	}
+	return false
 }
 
 func formatFailure(failure classifiedFailure) string {
