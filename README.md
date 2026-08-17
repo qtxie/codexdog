@@ -6,6 +6,10 @@ It preserves the Codex process. Recovery is for a stopped task/turn, not for res
 
 Codexdog owns only the app-server and TUI processes it starts and closes them on exit, without scanning for or terminating independent Codex sessions. On Windows, both processes are placed in a kill-on-close Job Object, so their descendants are also terminated if codexdog is closed unexpectedly.
 
+See the [user manual](docs/user-manual.md) for installation on each supported
+platform, complete configuration, Telegram setup, operations, and
+troubleshooting.
+
 ## Requirements
 
 - Go 1.24 or newer to build
@@ -25,6 +29,9 @@ $env:GOOS = "linux"; $env:GOARCH = "amd64"; go build -o codexdog .
 ```
 
 The other computer needs Codex CLI and its login/configuration, but does not need Go.
+
+The [Build workflow](.github/workflows/build.yml) tests and packages Linux
+amd64, Windows x86_64, and macOS arm64 binaries with SHA-256 checksum files.
 
 ## Run
 

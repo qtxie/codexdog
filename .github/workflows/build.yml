@@ -1,0 +1,129 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            binary: codexdog-linux-amd64
+            archive: codexdog-linux-amd64.tar.gz
+          - label: Windows x86_64
+            runner: windows-latest
+            goos: windows
+            goarch: amd64
+            binary: codexdog-windows-amd64.exe
+            archive: codexdog-windows-amd64.zip
+          - label: macOS arm64
+            runner: macos-15
+            goos: darwin
+            goarch: arm64
+            binary: codexdog-darwin-arm64
+            archive: codexdog-darwin-arm64.tar.gz
+    env:
+      CGO_ENABLED: "0"
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: go build -trimpath -ldflags="-s -w" -o ${{ matrix.binary }} .
+
+      - name: Verify binary on Linux or macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./${{ matrix.binary }} --version
+          go version -m ./${{ matrix.binary }} | tee build-metadata.txt
+          grep -Fq "GOOS=${GOOS}" build-metadata.txt
+          grep -Fq "GOARCH=${GOARCH}" build-metadata.txt
+
+      - name: Verify binary on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ".\${{ matrix.binary }}" --version
+          $metadata = go version -m ".\${{ matrix.binary }}"
+          $metadata | Tee-Object -FilePath build-metadata.txt
+          if ($metadata -notmatch "GOOS=$env:GOOS") { throw "Unexpected GOOS in binary metadata" }
+          if ($metadata -notmatch "GOARCH=$env:GOARCH") { throw "Unexpected GOARCH in binary metadata" }
+
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.archive }}" "${{ matrix.binary }}"
+          cd dist
+          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+
+      - name: Package macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.archive }}" "${{ matrix.binary }}"
+          cd dist
+          shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -LiteralPath "${{ matrix.binary }}" -DestinationPath "dist/${{ matrix.archive }}"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/${{ matrix.archive }}").Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.archive }}" | Set-Content -NoNewline "dist/${{ matrix.archive }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: codexdog-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
+          if-no-files-found: error
+          compression-level: 0
