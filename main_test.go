@@ -6,6 +6,37 @@ import (
 	"time"
 )
 
+func TestParseArgumentsTelegramConfiguration(t *testing.T) {
+	t.Setenv("CODEXDOG_TELEGRAM_BOT_TOKEN", "env-token")
+	t.Setenv("CODEXDOG_TELEGRAM_CHAT_IDS", "-10,-10")
+	t.Setenv("CODEXDOG_TELEGRAM_USER_IDS", "22")
+	args, err := parseArguments([]string{"start", "--telegram-chat-id", "-11", "--telegram-poll-timeout-sec", "12", "--telegram-no-notify"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Options.TelegramToken != "env-token" || fmt.Sprint(args.Options.TelegramAllowedChats) != "[-10 -11]" || fmt.Sprint(args.Options.TelegramAllowedUsers) != "[22]" {
+		t.Fatalf("Telegram options = %#v", args.Options)
+	}
+	if args.Options.TelegramPollTimeout != 12*time.Second || args.Options.TelegramNotify {
+		t.Fatalf("Telegram timing/notify options = %#v", args.Options)
+	}
+	if args.Options.TelegramStatePath == "" {
+		t.Fatal("Telegram offset path was not derived")
+	}
+}
+
+func TestValidateTelegramOptions(t *testing.T) {
+	if err := validateTelegramOptions(supervisorOptions{TelegramToken: "token"}); err == nil {
+		t.Fatal("token without chat allowlist was accepted")
+	}
+	if err := validateTelegramOptions(supervisorOptions{TelegramAllowedChats: []int64{1}}); err == nil {
+		t.Fatal("allowlist without token was accepted")
+	}
+	if err := validateTelegramOptions(supervisorOptions{TelegramToken: "token", TelegramAllowedChats: []int64{1}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestParseArgumentsPreservesCodexArguments(t *testing.T) {
 	args, err := parseArguments([]string{
 		"start", "-C", ".",

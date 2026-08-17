@@ -20,6 +20,10 @@ type controlServer struct {
 }
 
 func startControlServer(state func() supervisorState, stop func()) (*controlServer, error) {
+	return startControlServerWithActions(state, nil, stop)
+}
+
+func startControlServerWithActions(state func() supervisorState, action func(context.Context, remoteCommand) (string, error), stop func()) (*controlServer, error) {
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return nil, err
@@ -57,6 +61,34 @@ func startControlServer(state func() supervisorState, stop func()) (*controlServ
 		writer.WriteHeader(http.StatusAccepted)
 		go stop()
 	})
+	mux.HandleFunc("/command", func(writer http.ResponseWriter, request *http.Request) {
+		if !authorized(request) {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if action == nil {
+			writer.WriteHeader(http.StatusNotImplemented)
+			return
+		}
+		request.Body = http.MaxBytesReader(writer, request.Body, 16*1024)
+		var command remoteCommand
+		if err := json.NewDecoder(request.Body).Decode(&command); err != nil {
+			writeControlJSON(writer, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid command JSON"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(request.Context(), 45*time.Second)
+		defer cancel()
+		message, err := action(ctx, command)
+		if err != nil {
+			writeControlJSON(writer, http.StatusBadRequest, map[string]any{"ok": false, "error": sanitizeText(err.Error())})
+			return
+		}
+		writeControlJSON(writer, http.StatusOK, map[string]any{"ok": true, "message": message})
+	})
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -64,6 +96,12 @@ func startControlServer(state func() supervisorState, stop func()) (*controlServ
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	return &controlServer{Port: listener.Addr().(*net.TCPAddr).Port, Token: token, server: server}, nil
+}
+
+func writeControlJSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
 }
 
 func (c *controlServer) Close() error {

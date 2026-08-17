@@ -23,6 +23,7 @@ type supervisorState struct {
 	ControlToken              string `json:"controlToken,omitempty"`
 	CurrentThreadID           string `json:"currentThreadId,omitempty"`
 	ActiveTurnID              string `json:"activeTurnId,omitempty"`
+	ManualPaused              bool   `json:"manualPaused,omitempty"`
 	LastFailedTurnID          string `json:"lastFailedTurnId,omitempty"`
 	ResumeRequestedForTurnID  string `json:"resumeRequestedForTurnId,omitempty"`
 	AutomaticResumeCount      int    `json:"automaticResumeCount"`
@@ -34,6 +35,9 @@ type supervisorState struct {
 	StallPausedReason         string `json:"stallPausedReason,omitempty"`
 	NextProbeAt               string `json:"nextProbeAt,omitempty"`
 	LastError                 string `json:"lastError,omitempty"`
+	TelegramEnabled           bool   `json:"telegramEnabled,omitempty"`
+	TelegramLastError         string `json:"telegramLastError,omitempty"`
+	TelegramLastUpdateAt      string `json:"telegramLastUpdateAt,omitempty"`
 	TerminalErrorSuspectedAt  string `json:"terminalErrorSuspectedAt,omitempty"`
 	UpdatedAt                 string `json:"updatedAt"`
 	StoppedReason             string `json:"stoppedReason,omitempty"`

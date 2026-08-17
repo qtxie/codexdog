@@ -46,6 +46,61 @@ codexdog status -C . --json
 codexdog stop -C .
 ```
 
+## Telegram remote control
+
+Codexdog can expose the same supervisor controls through a Telegram bot. The
+bot uses HTTPS long polling; it does not open an inbound port on the computer.
+Configure the token through an environment variable or a private file, and
+always configure an explicit chat allowlist:
+
+```powershell
+$env:CODEXDOG_TELEGRAM_BOT_TOKEN = "123456:replace-me"
+$env:CODEXDOG_TELEGRAM_CHAT_IDS = "-1001234567890"
+$env:CODEXDOG_TELEGRAM_USER_IDS = "123456789" # optional additional restriction
+codexdog start -C .
+```
+
+For a token file, use `--telegram-token-file C:\secrets\codexdog-bot.txt` (or
+`CODEXDOG_TELEGRAM_TOKEN_FILE`). The file is read once at startup and the token
+is never written to supervisor state or logs. Repeat `--telegram-chat-id` and
+`--telegram-user-id` when more than one identity is allowed. A bot token without
+a chat allowlist is rejected at startup.
+
+The available commands are:
+
+```text
+/status
+/prompt TEXT
+/pause
+/resume
+/goal
+/goal pause
+/goal resume
+/goal set OBJECTIVE
+/stop confirm
+/help
+```
+
+`/prompt` steers an active turn with `turn/steer`; when the thread is idle it
+resumes the thread and starts a new text turn. `/pause` interrupts an active
+turn, cancels provider/stall recovery, and leaves future automatic recovery
+disabled until `/resume`. A saved Codex goal is resumed through
+`thread/goal/set` without injecting a synthetic prompt. `/stop` requires the
+literal confirmation word so an accidental message cannot terminate the
+supervisor.
+
+Telegram update offsets are persisted per workspace under the configured state
+directory. This prevents already-processed commands from being replayed after
+a restart. Lifecycle notifications (turn failures, recovery, resumes, and
+shutdown) are enabled by default; disable them with `--telegram-no-notify`.
+The poller retries transient Telegram/API transport failures and records the
+last Telegram error in `codexdog status --json`; Telegram outages do not change
+the Codex provider-recovery state.
+
+The local authenticated control server also accepts the same command layer at
+`POST /command` with a JSON body such as `{"name":"status"}`. It remains
+loopback-only and requires the bearer token in the state file.
+
 State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervisor` on Windows and `$HOME/.local/state/codex-supervisor` elsewhere. Set `CODEXDOG_HOME`, `CODEX_SUPERVISOR_HOME`, or pass `--state-dir` to change this.
 
 ## Recovery behavior

@@ -79,6 +79,8 @@ func run(argv []string) (int, error) {
 			fmt.Printf("Stall suspected: %s\n", valueOrDash(state.StallSuspectedAt))
 			fmt.Printf("Watchdog pause: %s\n", valueOrDash(state.StallPausedReason))
 			fmt.Printf("Terminal error suspected: %s\n", valueOrDash(state.TerminalErrorSuspectedAt))
+			fmt.Printf("Manual pause: %s\n", yesNo(state.ManualPaused))
+			fmt.Printf("Telegram control: %s\n", yesNo(state.TelegramEnabled))
 			fmt.Printf("Last error: %s\n", valueOrDash(state.LastError))
 			fmt.Printf("Updated: %s\n", state.UpdatedAt)
 		}
@@ -96,6 +98,9 @@ func run(argv []string) (int, error) {
 	case "smoke", "canary":
 		return runProtocolSmoke(args.Options, args.Command == "canary")
 	case "start":
+		if err := validateTelegramOptions(args.Options); err != nil {
+			return 1, err
+		}
 		if state, ok := store.Read(); ok && queryControl(state) {
 			return 1, fmt.Errorf("a supervisor is already running for %s", args.Options.CWD)
 		}
@@ -141,7 +146,26 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		CWD: cwd, CodexPath: "codex", ProbeTimeout: 120 * time.Second, TerminalErrorGrace: 5 * time.Second,
 		ProbeSuccesses: 2, Backoff: append([]time.Duration(nil), defaultBackoff...), MaxAutoResumes: 5,
 		StallConfirm: 30 * time.Second, StallInterruptTimeout: 15 * time.Second, MaxStallResumes: 2,
+		TelegramPollTimeout: telegramDefaultPollTimeout, TelegramNotify: true,
 	}
+	if token := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_BOT_TOKEN")); token != "" {
+		options.TelegramToken = token
+	}
+	if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_CHAT_IDS")); value != "" {
+		parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_CHAT_IDS")
+		if err != nil {
+			return parsedArguments{}, err
+		}
+		options.TelegramAllowedChats = append(options.TelegramAllowedChats, parsed...)
+	}
+	if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_USER_IDS")); value != "" {
+		parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_USER_IDS")
+		if err != nil {
+			return parsedArguments{}, err
+		}
+		options.TelegramAllowedUsers = append(options.TelegramAllowedUsers, parsed...)
+	}
+	telegramTokenFile := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_TOKEN_FILE"))
 	jsonOutput := false
 	valueAfter := func(flag string) (string, error) {
 		index++
@@ -280,6 +304,47 @@ func parseArguments(argv []string) (parsedArguments, error) {
 				return parsedArguments{}, err
 			}
 			options.ToolStallTimeout = time.Duration(parsed) * time.Millisecond
+		case "--telegram-token-file":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			telegramTokenFile = value
+		case "--telegram-chat-id":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			parsed, err := parseTelegramID(value, arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.TelegramAllowedChats = append(options.TelegramAllowedChats, parsed)
+		case "--telegram-user-id":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			parsed, err := parseTelegramID(value, arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.TelegramAllowedUsers = append(options.TelegramAllowedUsers, parsed)
+		case "--telegram-poll-timeout-sec":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			parsed, err := positiveInteger(value, arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			if parsed > 50 {
+				return parsedArguments{}, fmt.Errorf("%s must be between 1 and 50", arg)
+			}
+			options.TelegramPollTimeout = time.Duration(parsed) * time.Second
+		case "--telegram-no-notify":
+			options.TelegramNotify = false
 		case "--backoff-ms":
 			value, err := valueAfter(arg)
 			if err != nil {
@@ -316,7 +381,71 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	if err != nil {
 		return parsedArguments{}, err
 	}
+	if telegramTokenFile != "" {
+		data, readErr := os.ReadFile(telegramTokenFile)
+		if readErr != nil {
+			return parsedArguments{}, fmt.Errorf("read Telegram token file: %w", readErr)
+		}
+		fileToken := strings.TrimSpace(string(data))
+		if fileToken == "" {
+			return parsedArguments{}, errors.New("Telegram token file is empty")
+		}
+		if options.TelegramToken != "" && options.TelegramToken != fileToken {
+			return parsedArguments{}, errors.New("Telegram bot token differs between environment and token file")
+		}
+		options.TelegramToken = fileToken
+	}
+	options.TelegramAllowedChats = uniqueInt64(options.TelegramAllowedChats)
+	options.TelegramAllowedUsers = uniqueInt64(options.TelegramAllowedUsers)
+	options.TelegramStatePath = filepath.Join(absoluteRoot, "telegram-"+workspaceKey(options.CWD)+".json")
 	return parsedArguments{Command: command, StateRoot: absoluteRoot, JSON: jsonOutput, Options: options}, nil
+}
+
+func parseTelegramID(value, flag string) (int64, error) {
+	parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || parsed == 0 {
+		return 0, fmt.Errorf("%s requires a non-zero integer Telegram ID", flag)
+	}
+	return parsed, nil
+}
+
+func parseInt64List(value, name string) ([]int64, error) {
+	items := strings.Split(value, ",")
+	result := make([]int64, 0, len(items))
+	for _, item := range items {
+		parsed, err := parseTelegramID(strings.TrimSpace(item), name)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, parsed)
+	}
+	return result, nil
+}
+
+func uniqueInt64(values []int64) []int64 {
+	seen := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func validateTelegramOptions(options supervisorOptions) error {
+	if strings.TrimSpace(options.TelegramToken) == "" {
+		if len(options.TelegramAllowedChats) > 0 || len(options.TelegramAllowedUsers) > 0 {
+			return errors.New("Telegram chat/user IDs were provided but no bot token is configured")
+		}
+		return nil
+	}
+	if len(options.TelegramAllowedChats) == 0 {
+		return errors.New("Telegram control requires at least one --telegram-chat-id (or CODEXDOG_TELEGRAM_CHAT_IDS)")
+	}
+	return nil
 }
 
 func positiveInteger(value, flag string) (int, error) {
@@ -367,6 +496,12 @@ Options:
                                Interrupt/confirmation RPC timeout (default: 15000)
   --max-stall-resumes N       Consecutive stalled-turn resume limit (default: 2)
   --tool-stall-timeout-ms MS  Silent active-tool timeout; 0 disables it (default: 0)
+  --telegram-token-file PATH  Read the Telegram bot token from a private file
+  --telegram-chat-id ID       Allow a Telegram chat; repeatable
+  --telegram-user-id ID       Optionally restrict allowed senders; repeatable
+  --telegram-poll-timeout-sec N
+                               Long-poll timeout from 1 to 50 seconds (default: 30)
+  --telegram-no-notify         Disable unsolicited lifecycle notifications
   --state-dir DIR             State and log directory
   --json                      JSON output for status
   -h, --help                  Show help
@@ -376,6 +511,8 @@ Examples:
   codexdog start -C . --stall-timeout-ms 600000
   codexdog start -C . -- resume -s danger-full-access
   codexdog status -C . --json
+  $env:CODEXDOG_TELEGRAM_BOT_TOKEN = "..."
+  codexdog start -C . --telegram-chat-id 123456789
 `)
 }
 
