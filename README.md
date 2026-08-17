@@ -1,6 +1,6 @@
 # Codexdog
 
-Codexdog is a native Go wrapper around the Codex CLI. It keeps the normal Codex terminal UI, observes structured app-server events, probes a custom provider after transient failures, and resumes the interrupted thread after the provider recovers. An optional stalled-turn watchdog detects active turns that stop producing activity, interrupts them, and sends `continue`.
+Codexdog is a native Go wrapper around the Codex CLI. It keeps the normal Codex terminal UI, observes structured app-server events, probes a custom provider after turn failures, and resumes the interrupted thread after the provider recovers. An optional stalled-turn watchdog detects active turns that stop producing activity, interrupts them, and sends `continue`.
 
 It preserves the Codex process. Recovery is for a stopped task/turn, not for restarting the Codex CLI process.
 
@@ -51,14 +51,14 @@ State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervis
 ## Recovery behavior
 
 1. Observe `error` and terminal `turn/completed` events from the same connection used by the TUI.
-2. Recover connection, stream, timeout, overload, rate-limit, upstream `5xx`, and exhausted Codex transport retries. Authentication, configuration, sandbox, context-window, approval, usage-limit, and unknown failures without prior retry evidence require attention.
-3. When Codex reports a transient error with `willRetry=false`, wait up to `--error-grace-ms` for the normal terminal event. Any continued activity restarts this grace period.
+2. Treat every terminal Codex error as recoverable, including authentication, configuration, `4xx`, `5xx`, timeout, usage-limit, and unknown errors. Error type and HTTP status are retained in state and logs for diagnosis.
+3. When Codex reports an error with `willRetry=false`, wait up to `--error-grace-ms` for the normal terminal event. Any continued activity restarts this grace period.
 4. If the terminal event is missing, read the thread status. A thread waiting for approval or user input is left alone. An active, non-waiting turn is interrupted; an already-idle thread proceeds directly to recovery.
 5. Probe through a dedicated ephemeral Codex thread using the same provider and authentication. The canary is instructed not to call tools.
 6. Require two successful canaries by default.
-7. Continue the exact failed thread and workspace.
+7. Continue the exact failed thread and workspace. If the thread has a non-complete persisted goal, reactivate it through `thread/goal/set` and let Codex's automatic goal continuation proceed without injecting a user prompt. Threads without an active goal use the normal semantic continuation prompt.
 8. For `cyberPolicy`, retry the same thread with `continue`, retry it with `继续`, then fork through the failed turn and try `continue` once on the new thread. These retries do not wait for provider probes.
-9. Stop after five automatic resumptions, after the forked cyber-policy retry fails, or after a permanent failure.
+9. Provider probes keep retrying regardless of their error type or HTTP status. Stop after five automatic resumptions or after the forked cyber-policy retry fails.
 
 The continuation is semantic: Codex reuses the saved thread and current workspace, but cannot resume at the exact interrupted output token.
 
@@ -91,7 +91,7 @@ A suspected turn must remain silent through `--stall-confirm-ms` and still repor
 --probe-model model-name
 ```
 
-When `--health-url` is omitted, recovery uses the ephemeral Codex canary directly. The health URL is optional and should be a cheap endpoint for the custom provider; a successful endpoint check still requires the configured number of Codex canaries before resuming.
+When `--health-url` is omitted, recovery uses the ephemeral Codex canary directly. The health URL is optional and should be a cheap endpoint for the custom provider. Any non-`2xx` response, including `400` or `404`, is treated as unhealthy and retried with the configured backoff. A successful endpoint check still requires the configured number of Codex canaries before resuming.
 
 ## Compatibility checks
 

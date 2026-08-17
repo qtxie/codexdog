@@ -425,10 +425,8 @@ func (s *supervisor) handleTurnError(params map[string]any) {
 	}
 	s.logger.Log(fmt.Sprintf("Turn %s error (willRetry=%t, disposition=%s, code=%s): %s", turnID, willRetry, failure.Disposition, failure.Code, parsed.Message))
 
-	if willRetry || failure.Disposition != "transient" {
-		if willRetry {
-			s.cancelPendingTerminalError(turnID)
-		}
+	if willRetry {
+		s.cancelPendingTerminalError(turnID)
 		return
 	}
 	s.schedulePendingTerminalError(recoveryContext{ThreadID: threadID, FailedTurnID: turnID, Failure: failure})
@@ -457,7 +455,7 @@ func (s *supervisor) schedulePendingTerminalError(recovery recoveryContext) {
 	s.state.LastError = sanitizeText(formatFailure(recovery.Failure))
 	s.mu.Unlock()
 	_ = s.persist()
-	s.logger.Log(fmt.Sprintf("Waiting %s for terminal event after transient error on turn %s", s.options.TerminalErrorGrace, recovery.FailedTurnID))
+	s.logger.Log(fmt.Sprintf("Waiting %s for terminal event after error on turn %s", s.options.TerminalErrorGrace, recovery.FailedTurnID))
 }
 
 func (s *supervisor) armPendingTerminalErrorLocked(pending *pendingTerminalError) {
@@ -495,7 +493,7 @@ func (s *supervisor) deferPendingTerminalError(message rpcMessage) {
 	}
 	s.mu.Unlock()
 	if deferred {
-		s.logger.Log("Turn activity deferred transient-error reconciliation")
+		s.logger.Log("Turn activity deferred terminal-error reconciliation")
 	}
 }
 
@@ -625,7 +623,7 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 		if pendingError != nil && pendingError.Interrupting {
 			s.modifyState(func(state *supervisorState) { state.Phase = "provider-down" })
 			_ = s.persist()
-			s.logger.Log("Transient-error interrupt completed for turn " + parsed.ID)
+			s.logger.Log("Terminal-error interrupt completed for turn " + parsed.ID)
 			s.startRecovery(pendingError.Recovery)
 			return
 		}
@@ -665,8 +663,6 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 	context := recoveryContext{ThreadID: threadID, FailedTurnID: parsed.ID, Failure: failure}
 	if failure.Code == "cyberPolicy" {
 		go s.recoverCyberPolicy(context)
-	} else if failure.Disposition == "permanent" {
-		_ = s.setAttention("Non-recoverable turn failure: " + formatFailure(failure))
 	} else {
 		s.startRecovery(context)
 	}
@@ -777,7 +773,7 @@ func (s *supervisor) reconcilePendingTerminalError(turnID string, generation uin
 	s.state.Phase = "interrupting-error"
 	s.mu.Unlock()
 	_ = s.persist()
-	s.logger.Log("Interrupting turn " + turnID + " after a transient error produced no terminal event")
+	s.logger.Log("Interrupting turn " + turnID + " after an error produced no terminal event")
 
 	ctx, cancel = context.WithTimeout(context.Background(), s.options.StallInterruptTimeout)
 	_, err = proxy.Request(ctx, "turn/interrupt", map[string]any{"threadId": recovery.ThreadID, "turnId": turnID})
@@ -875,7 +871,7 @@ func (s *supervisor) recoverPendingErrorWithoutTerminal(turnID string, generatio
 	s.watchdog.CompleteTurn(turnID)
 	s.syncStallState()
 	_ = s.persist()
-	s.logger.Log("Recovering transient error for turn " + turnID + " after thread status became terminal without turn/completed")
+	s.logger.Log("Recovering error for turn " + turnID + " after thread status became terminal without turn/completed")
 	s.startRecovery(recovery)
 }
 
@@ -1322,9 +1318,6 @@ func (s *supervisor) runRecovery(ctx context.Context, recovery recoveryContext) 
 			})
 			_ = s.persist()
 			s.logger.Log("Provider probe failed: " + lastError)
-			if result.Failure != nil && result.Failure.Disposition == "permanent" {
-				return s.setAttention("Provider probe requires attention: " + formatFailure(*result.Failure))
-			}
 		}
 		retryAfter = result.RetryAfter
 		attempt++
@@ -1353,6 +1346,29 @@ func (s *supervisor) resumeThread(ctx context.Context, recovery recoveryContext)
 		s.submittingResume = false
 		s.mu.Unlock()
 	}()
+	goal, hasGoal := s.goalForRecovery(ctx, recovery.ThreadID)
+	if hasGoal {
+		value, err := s.proxy.Request(ctx, "thread/goal/set", map[string]any{
+			"threadId": recovery.ThreadID,
+			"status":   "active",
+		})
+		if err != nil {
+			return fmt.Errorf("resume goal: %w", err)
+		}
+		object, _ := asObject(value)
+		resumedGoal, ok := readThreadGoal(object["goal"])
+		if !ok || resumedGoal.Status != "active" {
+			return errors.New("Codex did not confirm the resumed goal")
+		}
+		s.modifyState(func(state *supervisorState) {
+			state.CurrentThreadID = recovery.ThreadID
+			state.ProbeAttempt = 0
+			state.ConsecutiveProbeSuccesses = 0
+		})
+		_ = s.persist()
+		s.logger.Log(fmt.Sprintf("Resumed %s goal on thread %s after failure %s", goal.Status, recovery.ThreadID, recovery.FailedTurnID))
+		return nil
+	}
 	if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": recovery.ThreadID, "cwd": s.options.CWD}); err != nil {
 		return err
 	}
@@ -1382,6 +1398,36 @@ func (s *supervisor) resumeThread(ctx context.Context, recovery recoveryContext)
 	_ = s.persist()
 	s.logger.Log(fmt.Sprintf("Resumed thread %s as turn %s after failure %s", recovery.ThreadID, started.ID, recovery.FailedTurnID))
 	return nil
+}
+
+func (s *supervisor) goalForRecovery(ctx context.Context, threadID string) (threadGoal, bool) {
+	value, err := s.proxy.Request(ctx, "thread/goal/get", map[string]any{"threadId": threadID})
+	if err != nil {
+		s.logger.Log("Goal lookup failed; using prompt-based recovery: " + err.Error())
+		return threadGoal{}, false
+	}
+	object, ok := asObject(value)
+	if !ok {
+		s.logger.Log("Goal lookup returned an invalid response; using prompt-based recovery")
+		return threadGoal{}, false
+	}
+	if object["goal"] == nil {
+		return threadGoal{}, false
+	}
+	goal, ok := readThreadGoal(object["goal"])
+	if !ok || !isResumableGoalStatus(goal.Status) {
+		return threadGoal{}, false
+	}
+	return goal, true
+}
+
+func isResumableGoalStatus(status string) bool {
+	switch status {
+	case "active", "paused", "blocked", "usageLimited", "budgetLimited":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *supervisor) cancelRecovery() {

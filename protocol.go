@@ -25,6 +25,11 @@ type turn struct {
 	Error  *turnError
 }
 
+type threadGoal struct {
+	Objective string
+	Status    string
+}
+
 func parseRPC(data []byte) (rpcMessage, bool) {
 	var message rpcMessage
 	if err := json.Unmarshal(data, &message); err != nil {
@@ -92,6 +97,19 @@ func readTurnError(value any) (turnError, bool) {
 		result.AdditionalDetails = &details
 	}
 	return result, true
+}
+
+func readThreadGoal(value any) (threadGoal, bool) {
+	object, ok := asObject(value)
+	if !ok {
+		return threadGoal{}, false
+	}
+	objective, objectiveOK := readString(object["objective"])
+	status, statusOK := readString(object["status"])
+	if !objectiveOK || objective == "" || !statusOK {
+		return threadGoal{}, false
+	}
+	return threadGoal{Objective: objective, Status: status}, true
 }
 
 func decodeResult(raw json.RawMessage) (any, error) {
