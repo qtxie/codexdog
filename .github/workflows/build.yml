@@ -127,3 +127,40 @@ jobs:
             dist/${{ matrix.archive }}.sha256
           if-no-files-found: error
           compression-level: 0
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: codexdog-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check codexdog-linux-amd64.tar.gz.sha256
+          sha256sum --check codexdog-windows-amd64.zip.sha256
+          sha256sum --check codexdog-darwin-arm64.tar.gz.sha256
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

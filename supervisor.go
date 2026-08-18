@@ -182,8 +182,33 @@ func (s *supervisor) Run() (int, error) {
 	}
 	s.proxy = proxy
 	s.proxyServer = proxy
+	tuiInitialized := make(chan struct{}, 1)
 	proxy.OnServerMessage(func(message rpcMessage, _ string) { s.enqueue(false, message) })
-	proxy.OnClientMessage(func(message rpcMessage, _ string) { s.enqueue(true, message) })
+	proxy.OnClientMessage(func(message rpcMessage, _ string) {
+		s.enqueue(true, message)
+		if message.Method == "initialized" {
+			select {
+			case tuiInitialized <- struct{}{}:
+			default:
+			}
+		}
+	})
+
+	// App-server derives its base upstream User-Agent from the first initialized client.
+	proxyURL := fmt.Sprintf("ws://127.0.0.1:%d", proxyPort)
+	fmt.Printf("Codexdog is active for %s\n", s.options.CWD)
+	fmt.Printf("State: %s\n", s.store.Path)
+	tuiDone, err := s.spawnTUI(proxyURL)
+	if err != nil {
+		return s.startupFailure(err)
+	}
+	select {
+	case <-tuiInitialized:
+	case err := <-tuiDone:
+		return s.startupFailure(fmt.Errorf("Codex TUI exited with code %d before initialization", processExitCode(err)))
+	case <-time.After(10 * time.Second):
+		return s.startupFailure(errors.New("timed out waiting for Codex TUI initialization"))
+	}
 
 	rpcTimeout := max(30*time.Second, s.options.ProbeTimeout)
 	rpc := newJSONRPCClient(appURL, rpcTimeout)
@@ -213,18 +238,12 @@ func (s *supervisor) Run() (int, error) {
 	}
 	s.startStallWatchdog()
 
-	proxyURL := fmt.Sprintf("ws://127.0.0.1:%d", proxyPort)
-	fmt.Printf("Codexdog is active for %s\n", s.options.CWD)
-	fmt.Printf("State: %s\n", s.store.Path)
-	if err := s.spawnTUI(proxyURL); err != nil {
-		return s.startupFailure(err)
-	}
 	if err := s.startTelegram(); err != nil {
 		return s.startupFailure(fmt.Errorf("start Telegram control: %w", err))
 	}
 	stopSignals := s.installSignalHandlers()
 	defer stopSignals()
-	err = s.tuiCmd.Wait()
+	err = <-tuiDone
 	if s.isShuttingDown() {
 		return 0, nil
 	}
@@ -309,7 +328,7 @@ func (s *supervisor) spawnAppServer(url string) (<-chan error, error) {
 	return done, nil
 }
 
-func (s *supervisor) spawnTUI(proxyURL string) error {
+func (s *supervisor) spawnTUI(proxyURL string) (<-chan error, error) {
 	args := []string{}
 	for _, value := range s.options.CodexConfig {
 		args = append(args, "-c", value)
@@ -326,9 +345,14 @@ func (s *supervisor) spawnTUI(proxyURL string) error {
 	s.tuiCmd = command
 	s.mu.Unlock()
 	if processes == nil {
-		return errors.New("child process management is unavailable")
+		return nil, errors.New("child process management is unavailable")
 	}
-	return processes.Start(command, false)
+	if err := processes.Start(command, false); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	return done, nil
 }
 
 func (s *supervisor) enqueue(client bool, message rpcMessage) {

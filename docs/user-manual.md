@@ -432,5 +432,7 @@ with `v`, pull requests, and manual dispatch. Each target builds on its native
 GitHub-hosted runner, runs module verification, vet, and unit tests, verifies the
 compiled target metadata, then uploads a packaged binary and SHA-256 sidecar.
 
-The workflow does not publish a GitHub Release and does not sign or notarize
-binaries. Those are separate release-management and credentialed signing steps.
+After all target builds succeed for a pushed version tag, the workflow verifies
+the packaged artifacts against their SHA-256 sidecars and publishes a GitHub
+Release with generated release notes. The three archives and their checksum
+files are attached to the release. Binaries are not signed or notarized.
