@@ -86,8 +86,8 @@ jobs:
           & ".\${{ matrix.binary }}" --version
           $metadata = go version -m ".\${{ matrix.binary }}"
           $metadata | Tee-Object -FilePath build-metadata.txt
-          if ($metadata -notmatch "GOOS=$env:GOOS") { throw "Unexpected GOOS in binary metadata" }
-          if ($metadata -notmatch "GOARCH=$env:GOARCH") { throw "Unexpected GOARCH in binary metadata" }
+          if (-not ($metadata -match "GOOS=$env:GOOS")) { throw "Unexpected GOOS in binary metadata" }
+          if (-not ($metadata -match "GOARCH=$env:GOARCH")) { throw "Unexpected GOARCH in binary metadata" }
 
       - name: Package Linux binary
         if: runner.os == 'Linux'
