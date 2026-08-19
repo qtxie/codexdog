@@ -194,6 +194,13 @@ For a normal failed turn, recovery works as follows:
 6. Recovery stops in `needs-attention` after the configured consecutive
    automatic resume limit is reached.
 
+Multi-agent v2 child threads are observational only. Codexdog records their
+activity but does not issue direct `thread/resume` or `turn/start` requests when
+their `canAcceptDirectInput` capability is false (or their `parentThreadId`
+identifies them as a child). The parent agent remains responsible for retrying
+or continuing that child; only direct-input threads enter provider or stall
+recovery.
+
 A timeout while compacting, including an SSE idle timeout, follows this same
 generic terminal-error recovery path.
 
@@ -391,6 +398,11 @@ Confirm that consecutive canary successes reached `--probe-successes`. Also
 check for `paused`, `waiting-for-user`, or `needs-attention`, and whether
 `--max-auto-resumes` was reached. A health URL returning `2xx` is insufficient
 when the real Codex canary still fails.
+
+If the last error says `direct app-server input is not allowed for multi-agent
+v2 sub-agents`, update Codexdog to a build with multi-agent thread filtering.
+The message means a child thread was mistakenly targeted with a direct
+`thread/resume`/`turn/start`; the parent thread must own that continuation.
 
 ### The health URL always fails
 

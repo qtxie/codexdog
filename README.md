@@ -113,7 +113,7 @@ State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervis
 ## Recovery behavior
 
 1. Observe `error` and terminal `turn/completed` events from the same connection used by the TUI.
-2. Treat every terminal Codex error as recoverable, including authentication, configuration, `4xx`, `5xx`, timeout, usage-limit, and unknown errors. Error type and HTTP status are retained in state and logs for diagnosis.
+2. Treat every terminal Codex error from a direct-input thread as recoverable, including authentication, configuration, `4xx`, `5xx`, timeout, usage-limit, and unknown errors. Error type and HTTP status are retained in state and logs for diagnosis.
 3. When Codex reports an error with `willRetry=false`, wait up to `--error-grace-ms` for the normal terminal event. Any continued activity restarts this grace period.
 4. If the terminal event is missing, read the thread status. A thread waiting for approval or user input is left alone. An active, non-waiting turn is interrupted; an already-idle thread proceeds directly to recovery.
 5. Probe through a dedicated ephemeral Codex thread using the same provider and authentication. The canary is instructed not to call tools.
@@ -123,6 +123,14 @@ State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervis
 9. Provider probes keep retrying regardless of their error type or HTTP status. Stop after five automatic resumptions or after the forked cyber-policy retry fails.
 
 The continuation is semantic: Codex reuses the saved thread and current workspace, but cannot resume at the exact interrupted output token.
+
+Codexdog also observes multi-agent v2 child threads so their activity remains
+visible through the TUI, but it does not send direct `turn/start` or
+`thread/resume` requests to them. Those threads advertise
+`canAcceptDirectInput=false` (and a `parentThreadId`); their parent agent owns
+continuation. Recovery is scheduled only for threads that accept direct input,
+which avoids the app-server error `direct app-server input is not allowed for
+multi-agent v2 sub-agents`.
 
 ## Stalled-turn watchdog
 

@@ -100,6 +100,7 @@ type supervisor struct {
 	turnHadRetryableError    map[string]bool
 	pendingTerminalErrors    map[string]*pendingTerminalError
 	handledTurns             map[string]bool
+	threadDirectInput        map[string]bool
 	cyberPolicyAttempts      map[string]int
 	watchdogInterruptedTurns map[string]bool
 	pauseInterruptingTurns   map[string]bool
@@ -126,6 +127,7 @@ func newSupervisor(options supervisorOptions, store *stateStore) *supervisor {
 		turnHadRetryableError:    map[string]bool{},
 		pendingTerminalErrors:    map[string]*pendingTerminalError{},
 		handledTurns:             map[string]bool{},
+		threadDirectInput:        map[string]bool{},
 		cyberPolicyAttempts:      map[string]int{},
 		watchdogInterruptedTurns: map[string]bool{},
 		pauseInterruptingTurns:   map[string]bool{},
@@ -448,6 +450,15 @@ func (s *supervisor) handleServerMessage(message rpcMessage) {
 	if message.Method == "" || message.Params == nil {
 		return
 	}
+	s.recordAgentManagedCollabThreads(message.Params)
+	if message.Method == "thread/started" {
+		s.handleThreadStarted(message.Params)
+		return
+	}
+	if threadID, _ := readString(message.Params["threadId"]); threadID != "" && !s.threadAcceptsDirectInput(threadID) {
+		s.handleAgentManagedThreadMessage(message, threadID)
+		return
+	}
 	observation := s.watchdog.Observe(message, time.Now())
 	if observation.Activity {
 		s.syncStallState()
@@ -467,12 +478,6 @@ func (s *supervisor) handleServerMessage(message rpcMessage) {
 	}
 
 	switch message.Method {
-	case "thread/started":
-		threadObject, _ := asObject(message.Params["thread"])
-		if id, ok := readString(threadObject["id"]); ok {
-			s.modifyState(func(state *supervisorState) { state.CurrentThreadID = id })
-			_ = s.persist()
-		}
 	case "thread/status/changed":
 		s.handleThreadStatus(message.Params)
 	case "error":
@@ -481,6 +486,103 @@ func (s *supervisor) handleServerMessage(message rpcMessage) {
 		s.handleTurnStarted(message.Params)
 	case "turn/completed":
 		s.handleTurnCompleted(message.Params)
+	}
+}
+
+func (s *supervisor) recordAgentManagedCollabThreads(params map[string]any) {
+	item, ok := asObject(params["item"])
+	if !ok {
+		return
+	}
+	typeName, _ := readString(item["type"])
+	if typeName != "collabToolCall" {
+		return
+	}
+	currentThreadID, _ := readString(params["threadId"])
+	senderThreadID, _ := readString(item["senderThreadId"])
+	childIDs := []string{}
+	if id, ok := readString(item["newThreadId"]); ok {
+		childIDs = append(childIDs, id)
+	}
+	if receiverID, ok := readString(item["receiverThreadId"]); ok && receiverID != "" && receiverID != currentThreadID && senderThreadID == currentThreadID {
+		childIDs = append(childIDs, receiverID)
+	}
+	if len(childIDs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	for _, id := range childIDs {
+		if id != "" {
+			s.threadDirectInput[id] = false
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *supervisor) handleThreadStarted(params map[string]any) {
+	threadObject, ok := asObject(params["thread"])
+	if !ok {
+		return
+	}
+	id, ok := readString(threadObject["id"])
+	if !ok || id == "" {
+		return
+	}
+	acceptsDirectInput, capabilityKnown := threadDirectInputCapability(threadObject)
+	s.mu.Lock()
+	if capabilityKnown {
+		s.threadDirectInput[id] = acceptsDirectInput
+	}
+	s.mu.Unlock()
+	if capabilityKnown && !acceptsDirectInput {
+		s.logger.Log("Observed agent-managed thread " + id + "; direct recovery is disabled")
+		return
+	}
+	s.modifyState(func(state *supervisorState) { state.CurrentThreadID = id })
+	_ = s.persist()
+}
+
+func threadDirectInputCapability(threadObject map[string]any) (bool, bool) {
+	if value, ok := readBool(threadObject["canAcceptDirectInput"]); ok {
+		return value, true
+	}
+	if parentID, ok := readString(threadObject["parentThreadId"]); ok && parentID != "" {
+		return false, true
+	}
+	if isSubagentThreadSource(threadObject["source"]) || isSubagentThreadSource(threadObject["threadSource"]) {
+		return false, true
+	}
+	return true, false
+}
+
+func isSubagentThreadSource(value any) bool {
+	if source, ok := readString(value); ok {
+		return strings.HasPrefix(strings.ToLower(source), "subagent")
+	}
+	if source, ok := asObject(value); ok {
+		for name := range source {
+			if strings.HasPrefix(strings.ToLower(name), "subagent") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *supervisor) threadAcceptsDirectInput(threadID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	accepts, known := s.threadDirectInput[threadID]
+	return !known || accepts
+}
+
+func (s *supervisor) handleAgentManagedThreadMessage(message rpcMessage, threadID string) {
+	if message.Method != "turn/completed" {
+		return
+	}
+	parsed, ok := readTurn(message.Params["turn"])
+	if ok && parsed.Status == "failed" {
+		s.logger.Log(fmt.Sprintf("Turn %s failed on agent-managed thread %s; parent orchestration owns recovery", parsed.ID, threadID))
 	}
 }
 
@@ -1167,6 +1269,12 @@ func (s *supervisor) confirmAndRecoverStall(stall stallContext, generation uint6
 		s.watchdog.CancelRecovery()
 		return
 	}
+	if !s.threadAcceptsDirectInput(stall.ThreadID) {
+		s.watchdog.CompleteTurn(stall.TurnID)
+		s.syncStallState()
+		s.logger.Log("Skipped stall recovery for agent-managed thread " + stall.ThreadID)
+		return
+	}
 	if s.proxy == nil {
 		s.watchdog.CancelRecovery()
 		_ = s.setAttention("Stall recovery is unavailable before the TUI proxy starts")
@@ -1356,6 +1464,10 @@ func (s *supervisor) stallGenerationMatches(generation uint64) bool {
 }
 
 func (s *supervisor) recoverCyberPolicy(recovery recoveryContext) {
+	if !s.threadAcceptsDirectInput(recovery.ThreadID) {
+		s.logger.Log("Skipped cyber policy recovery for agent-managed thread " + recovery.ThreadID)
+		return
+	}
 	if s.proxy == nil {
 		_ = s.setAttention("Cyber policy recovery is unavailable before the TUI proxy starts")
 		return
@@ -1456,6 +1568,10 @@ func (s *supervisor) recoverCyberPolicy(recovery recoveryContext) {
 }
 
 func (s *supervisor) startRecovery(recovery recoveryContext) {
+	if !s.threadAcceptsDirectInput(recovery.ThreadID) {
+		s.logger.Log("Skipped provider recovery for agent-managed thread " + recovery.ThreadID)
+		return
+	}
 	s.mu.Lock()
 	if s.state.ManualPaused {
 		s.mu.Unlock()
@@ -1570,6 +1686,10 @@ func (s *supervisor) runRecovery(ctx context.Context, recovery recoveryContext) 
 
 func (s *supervisor) resumeThread(ctx context.Context, recovery recoveryContext) error {
 	if s.proxy == nil || ctx.Err() != nil {
+		return nil
+	}
+	if !s.threadAcceptsDirectInput(recovery.ThreadID) {
+		s.logger.Log("Skipped direct resume for agent-managed thread " + recovery.ThreadID)
 		return nil
 	}
 	s.mu.Lock()

@@ -148,6 +148,139 @@ func TestSupervisorDoesNotResumeManualInterrupt(t *testing.T) {
 	}
 }
 
+func TestSupervisorIgnoresAgentManagedThreadLifecycle(t *testing.T) {
+	cwd := t.TempDir()
+	supervisor := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))
+	proxy := &mockProxy{request: func(context.Context, string, map[string]any) (any, error) {
+		t.Fatalf("agent-managed thread triggered a request")
+		return nil, nil
+	}}
+	supervisor.proxy = proxy
+
+	supervisor.handleServerMessage(rpcMessage{Method: "thread/started", Params: map[string]any{
+		"thread": map[string]any{
+			"id":                   "root-thread",
+			"canAcceptDirectInput": true,
+		},
+	}})
+	supervisor.handleServerMessage(rpcMessage{Method: "turn/started", Params: map[string]any{
+		"threadId": "root-thread",
+		"turn":     map[string]any{"id": "root-turn", "status": "inProgress"},
+	}})
+	supervisor.handleServerMessage(rpcMessage{Method: "thread/started", Params: map[string]any{
+		"thread": map[string]any{
+			"id":                   "child-thread",
+			"parentThreadId":       "root-thread",
+			"canAcceptDirectInput": false,
+		},
+	}})
+	supervisor.handleServerMessage(rpcMessage{Method: "turn/started", Params: map[string]any{
+		"threadId": "child-thread",
+		"turn":     map[string]any{"id": "child-turn", "status": "inProgress"},
+	}})
+	supervisor.handleServerMessage(rpcMessage{Method: "error", Params: map[string]any{
+		"threadId":  "child-thread",
+		"turnId":    "child-turn",
+		"willRetry": false,
+		"error":     map[string]any{"message": "provider unavailable"},
+	}})
+	supervisor.handleServerMessage(rpcMessage{Method: "turn/completed", Params: map[string]any{
+		"threadId": "child-thread",
+		"turn":     map[string]any{"id": "child-turn", "status": "failed"},
+	}})
+
+	state := supervisor.stateSnapshot()
+	if state.CurrentThreadID != "root-thread" || state.ActiveTurnID != "root-turn" || state.Phase != "running" || state.LastFailedTurnID != "" {
+		t.Fatalf("agent-managed lifecycle changed root state: %#v", state)
+	}
+	if got := supervisor.watchdog.Snapshot(); got.ThreadID != "root-thread" || got.TurnID != "root-turn" {
+		t.Fatalf("agent-managed lifecycle replaced watchdog turn: %#v", got)
+	}
+	if got := proxy.methods(); len(got) != 0 {
+		t.Fatalf("agent-managed lifecycle issued recovery requests: %v", got)
+	}
+}
+
+func TestSupervisorSkipsDirectResumeForAgentManagedThread(t *testing.T) {
+	cwd := t.TempDir()
+	supervisor := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))
+	proxy := &mockProxy{request: func(context.Context, string, map[string]any) (any, error) {
+		t.Fatalf("agent-managed thread was sent direct input")
+		return nil, nil
+	}}
+	supervisor.proxy = proxy
+	supervisor.handleServerMessage(rpcMessage{Method: "thread/started", Params: map[string]any{
+		"thread": map[string]any{"id": "child-thread", "parentThreadId": "root-thread"},
+	}})
+	if err := supervisor.resumeThread(context.Background(), recoveryContext{ThreadID: "child-thread", FailedTurnID: "child-turn"}); err != nil {
+		t.Fatalf("resumeThread() error = %v", err)
+	}
+	if got := proxy.methods(); len(got) != 0 {
+		t.Fatalf("guard issued requests: %v", got)
+	}
+}
+
+func TestSupervisorIdentifiesAgentThreadFromCollaborationItem(t *testing.T) {
+	cwd := t.TempDir()
+	supervisor := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))
+	proxy := &mockProxy{request: func(context.Context, string, map[string]any) (any, error) {
+		t.Fatalf("collaboration child triggered a request")
+		return nil, nil
+	}}
+	supervisor.proxy = proxy
+	supervisor.handleServerMessage(rpcMessage{Method: "thread/started", Params: map[string]any{
+		"thread": map[string]any{"id": "root-thread", "canAcceptDirectInput": true},
+	}})
+	supervisor.handleServerMessage(rpcMessage{Method: "turn/started", Params: map[string]any{
+		"threadId": "root-thread",
+		"turn":     map[string]any{"id": "root-turn", "status": "inProgress"},
+	}})
+	supervisor.handleServerMessage(rpcMessage{Method: "item/started", Params: map[string]any{
+		"threadId": "root-thread",
+		"item": map[string]any{
+			"type":           "collabToolCall",
+			"senderThreadId": "root-thread",
+			"newThreadId":    "child-thread",
+		},
+	}})
+	supervisor.handleServerMessage(rpcMessage{Method: "turn/completed", Params: map[string]any{
+		"threadId": "child-thread",
+		"turn":     map[string]any{"id": "child-turn", "status": "failed"},
+	}})
+	state := supervisor.stateSnapshot()
+	if state.CurrentThreadID != "root-thread" || state.ActiveTurnID != "root-turn" || state.Phase != "running" {
+		t.Fatalf("collaboration child changed root state: %#v", state)
+	}
+	if got := proxy.methods(); len(got) != 0 {
+		t.Fatalf("collaboration child issued recovery requests: %v", got)
+	}
+}
+
+func TestThreadDirectInputCapability(t *testing.T) {
+	tests := []struct {
+		name    string
+		thread  map[string]any
+		accepts bool
+		known   bool
+	}{
+		{name: "explicit root", thread: map[string]any{"canAcceptDirectInput": true}, accepts: true, known: true},
+		{name: "explicit agent", thread: map[string]any{"canAcceptDirectInput": false}, accepts: false, known: true},
+		{name: "explicit capability wins", thread: map[string]any{"canAcceptDirectInput": true, "parentThreadId": "root"}, accepts: true, known: true},
+		{name: "parent fallback", thread: map[string]any{"parentThreadId": "root"}, accepts: false, known: true},
+		{name: "source fallback", thread: map[string]any{"threadSource": "subagent"}, accepts: false, known: true},
+		{name: "session source fallback", thread: map[string]any{"source": map[string]any{"subAgent": map[string]any{}}}, accepts: false, known: true},
+		{name: "unknown legacy", thread: map[string]any{}, accepts: true, known: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			accepts, known := threadDirectInputCapability(test.thread)
+			if accepts != test.accepts || known != test.known {
+				t.Fatalf("threadDirectInputCapability() = (%t, %t), want (%t, %t)", accepts, known, test.accepts, test.known)
+			}
+		})
+	}
+}
+
 func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
