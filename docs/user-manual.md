@@ -15,7 +15,7 @@ Codex processes remain alive while Codexdog recovers the stopped turn.
 - Codex CLI login and provider configuration that already work without
   Codexdog.
 - Codex CLI `app-server` and `--remote` support. Codexdog currently targets the
-  app-server schema shipped with Codex CLI 0.146.0.
+  app-server schema shipped with Codex CLI 0.148.0.
 - Go 1.24 or newer only when building from source.
 
 Run these checks before using Codexdog:
@@ -138,6 +138,14 @@ codexdog stop -C /path/to/project
 Codexdog identifies a supervisor by the absolute workspace path. Use the same
 `-C` value for `start`, `status`, and `stop`.
 
+On Codex CLI 0.148.0, status also reports the current thread's input, cached,
+cache-write, output, reasoning, and total tokens; estimated credit and USD use;
+account credit balance; and primary/secondary rate-limit windows. `--json`
+exposes these as `tokenUsage`, `usageEstimate`, `accountUsage`, and `rateLimits`.
+Some account types and custom providers do not return every billing field. In
+that case Codexdog keeps supervising normally and records the read problem in
+`usageLastError`.
+
 ## Pass settings and arguments to Codex
 
 Codexdog parses its own options before `--`. Everything after `--` is passed
@@ -253,6 +261,10 @@ also pause the normal timer. Set `--tool-stall-timeout-ms` only when long-silent
 tools should be eligible for recovery. Manual Esc or Ctrl+C interruptions are
 never automatically resumed.
 
+Synchronous hooks count as active tools. Asynchronous hooks introduced in Codex
+0.148.0 record activity when they start, but their background lifetime does not
+pause the watchdog or hide a later stalled turn.
+
 ## Telegram remote control
 
 Telegram control uses outbound HTTPS long polling and does not open a public
@@ -288,7 +300,7 @@ Available bot commands:
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Show the supervisor, current thread, probe, and error state. |
+| `/status` | Show supervisor, thread, probe, usage/cost, credit, rate-limit, and error state. |
 | `/prompt TEXT` | Steer the active turn, or start a new turn on the current thread. |
 | `/pause` | Interrupt the active turn and suppress automatic recovery. |
 | `/resume` | Resume the current thread or reactivate its saved goal. |
@@ -299,8 +311,9 @@ Available bot commands:
 | `/stop confirm` | Stop Codexdog and the Codex processes it owns. |
 | `/help` | Show the command list. |
 
-Lifecycle notifications are enabled by default. Use `--telegram-no-notify` to
-keep command replies but disable unsolicited notifications. Telegram update
+Lifecycle notifications, including failed or blocked hook alerts, are enabled
+by default. Use `--telegram-no-notify` to keep command replies but disable
+unsolicited notifications. Telegram update
 offsets are saved per workspace so old commands are not replayed after restart.
 A Telegram outage is recorded in status and logs but does not change provider
 recovery.
@@ -424,6 +437,13 @@ Verify the bot token, chat ID, optional user ID, and outbound HTTPS access to th
 Telegram API. The chat allowlist must match `message.chat.id`; the optional user
 allowlist must match `message.from.id`. Inspect `telegramLastError` in JSON status
 and the workspace supervisor log.
+
+### Usage, cost, or rate limits are missing
+
+These fields require Codex CLI 0.148.0 and depend on the signed-in account and
+billing route. Inspect `usageLastError` with `codexdog status --json`. A missing
+USD estimate or credit balance can be a valid backend response and does not
+indicate that recovery or the watchdog is broken.
 
 ### Codex was upgraded
 

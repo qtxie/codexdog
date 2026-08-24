@@ -13,7 +13,7 @@ troubleshooting.
 ## Requirements
 
 - Go 1.24 or newer to build
-- Codex CLI with `app-server` and `--remote` support (tested with 0.146.0)
+- Codex CLI with `app-server` and `--remote` support (tested with 0.148.0)
 - A working Codex login and provider configuration
 
 ## Build and install
@@ -52,6 +52,12 @@ codexdog status -C .
 codexdog status -C . --json
 codexdog stop -C .
 ```
+
+With Codex CLI 0.148.0, text and JSON status include the current thread's token
+breakdown and estimated credit/USD usage, plus account credit balance and rate
+limit windows. Account-wide fields are shown only when the signed-in account and
+billing route provide them. Collection is best effort: a status RPC failure is
+reported as `usageLastError` and does not affect turn supervision or recovery.
 
 ## Telegram remote control
 
@@ -98,8 +104,9 @@ supervisor.
 
 Telegram update offsets are persisted per workspace under the configured state
 directory. This prevents already-processed commands from being replayed after
-a restart. Lifecycle notifications (turn failures, recovery, resumes, and
-shutdown) are enabled by default; disable them with `--telegram-no-notify`.
+a restart. Lifecycle notifications (turn failures, recovery, resumes, hook
+failures or blocks, and shutdown) are enabled by default; disable them with
+`--telegram-no-notify`.
 The poller retries transient Telegram/API transport failures and records the
 last Telegram error in `codexdog status --json`; Telegram outages do not change
 the Codex provider-recovery state.
@@ -140,7 +147,7 @@ The watchdog is disabled by default. Enable it with a non-zero timeout:
 codexdog start -C . --stall-timeout-ms 600000 -- --sandbox workspace-write
 ```
 
-Activity includes turn and item lifecycle events, streamed agent or reasoning output, command output, plan and diff updates, hooks, and token-usage updates. The normal timeout is paused while Codex waits for approval/user input, performs verification or safety buffering, or runs a command/tool. Quiet active tools are never interrupted unless `--tool-stall-timeout-ms` is also set.
+Activity includes turn and item lifecycle events, streamed agent or reasoning output, command output, plan and diff updates, hooks, and token-usage updates. The normal timeout is paused while Codex waits for approval/user input, performs verification or safety buffering, or runs a command/tool. Synchronous hooks pause the timer like other active tools; Codex 0.148.0 asynchronous hooks record activity when they start but continue running in the background and do not suppress later stall detection. Quiet active tools are never interrupted unless `--tool-stall-timeout-ms` is also set.
 
 A suspected turn must remain silent through `--stall-confirm-ms` and still report an active thread status before it is interrupted. User Esc/Ctrl+C interruptions remain manual and are never automatically continued. At most two stalled-turn resumptions are attempted by default.
 
@@ -175,4 +182,4 @@ codexdog canary
 
 `smoke` initializes the installed app-server and proxy, then creates and reads an ephemeral thread without consuming a model turn. `canary` additionally sends one minimal request through the configured provider.
 
-The protocol implementation targets the Codex CLI 0.146.0 app-server schema. Run `smoke` after upgrading Codex because app-server WebSocket transport is still experimental.
+The protocol implementation targets the Codex CLI 0.148.0 app-server schema. Run `smoke` after upgrading Codex because app-server WebSocket transport is still experimental.

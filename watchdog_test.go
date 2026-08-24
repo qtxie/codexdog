@@ -73,3 +73,33 @@ func TestWatchdogIgnoresOtherTurn(t *testing.T) {
 		t.Fatal("expected the original turn to be suspected")
 	}
 }
+
+func TestWatchdogDoesNotBlockOnAsyncHook(t *testing.T) {
+	start := time.Unix(0, 0)
+	watchdog := testWatchdog()
+	watchdog.StartTurn("thread-1", "turn-1", start)
+	observation := watchdog.Observe(watchdogEvent("hook/started", map[string]any{
+		"run": map[string]any{"id": "async-1", "executionMode": "async"},
+	}), start.Add(10*time.Millisecond))
+	if !observation.Activity || watchdog.Snapshot().PauseReason != "" {
+		t.Fatalf("async hook blocked watchdog: observation=%#v snapshot=%#v", observation, watchdog.Snapshot())
+	}
+	if decision, ok := watchdog.Evaluate(start.Add(110 * time.Millisecond)); !ok || decision.Kind != "suspected" {
+		t.Fatalf("async hook suppressed stall detection: decision=%#v ok=%t", decision, ok)
+	}
+
+	blocking := testWatchdog()
+	blocking.StartTurn("thread-1", "turn-1", start)
+	blocking.Observe(watchdogEvent("hook/started", map[string]any{
+		"run": map[string]any{"id": "sync-1", "executionMode": "sync"},
+	}), start.Add(10*time.Millisecond))
+	if _, ok := blocking.Evaluate(start.Add(time.Second)); ok || blocking.Snapshot().PauseReason != "activeTool:hook" {
+		t.Fatalf("sync hook did not pause watchdog: %#v", blocking.Snapshot())
+	}
+	blocking.Observe(watchdogEvent("hook/completed", map[string]any{
+		"run": map[string]any{"id": "sync-1", "executionMode": "sync"},
+	}), start.Add(time.Second))
+	if blocking.Snapshot().PauseReason != "" {
+		t.Fatalf("completed sync hook remained blocking: %#v", blocking.Snapshot())
+	}
+}

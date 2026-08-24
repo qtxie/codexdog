@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"testing"
 	"time"
 )
@@ -73,5 +76,58 @@ func TestParseArgumentsRequiresSeparatorForTUIArguments(t *testing.T) {
 func TestParseArgumentsRejectsInvalidTimeout(t *testing.T) {
 	if _, err := parseArguments([]string{"start", "--stall-timeout-ms", "-1"}); err == nil {
 		t.Fatal("negative stall timeout was accepted")
+	}
+}
+
+func TestStatusUsesLiveControlState(t *testing.T) {
+	workspace := t.TempDir()
+	stateRoot := t.TempDir()
+	live := supervisorState{
+		Version: 1, PID: os.Getpid(), CWD: workspace, Phase: "running", CurrentThreadID: "thread-live",
+		TokenUsage: &threadTokenUsageState{ThreadID: "thread-live", Total: tokenUsageBreakdownState{TotalTokens: 999}},
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	control, err := startControlServer(func() supervisorState { return live }, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	persisted := live
+	persisted.Phase = "stale"
+	persisted.TokenUsage = &threadTokenUsageState{ThreadID: "thread-stale", Total: tokenUsageBreakdownState{TotalTokens: 1}}
+	persisted.ControlPort = control.Port
+	persisted.ControlToken = control.Token
+	if err := newStateStore(stateRoot, workspace).Write(persisted); err != nil {
+		t.Fatal(err)
+	}
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = write
+	code, runErr := run([]string{"status", "-C", workspace, "--state-dir", stateRoot, "--json"})
+	os.Stdout = originalStdout
+	_ = write.Close()
+	output, readErr := io.ReadAll(read)
+	_ = read.Close()
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if code != 0 {
+		t.Fatalf("status exit code = %d", code)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode status %q: %v", output, err)
+	}
+	tokenUsage, _ := result["tokenUsage"].(map[string]any)
+	total, _ := tokenUsage["total"].(map[string]any)
+	if result["live"] != true || result["phase"] != "running" || total["totalTokens"] != float64(999) {
+		t.Fatalf("status used stale state: %s", output)
 	}
 }

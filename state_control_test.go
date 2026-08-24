@@ -45,7 +45,10 @@ func TestStateStoreAndPublicState(t *testing.T) {
 }
 
 func TestControlServer(t *testing.T) {
-	state := supervisorState{Version: 1, PID: os.Getpid(), CWD: t.TempDir(), Phase: "idle", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	state := supervisorState{
+		Version: 1, PID: os.Getpid(), CWD: t.TempDir(), Phase: "idle", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		TokenUsage: &threadTokenUsageState{ThreadID: "thread-1", Total: tokenUsageBreakdownState{TotalTokens: 123}},
+	}
 	stopped := make(chan struct{}, 1)
 	control, err := startControlServer(func() supervisorState { return state }, func() { stopped <- struct{}{} })
 	if err != nil {
@@ -55,6 +58,10 @@ func TestControlServer(t *testing.T) {
 	state.ControlPort, state.ControlToken = control.Port, control.Token
 	if !queryControl(state) {
 		t.Fatal("authenticated status request failed")
+	}
+	liveState, ok := queryControlState(state)
+	if !ok || liveState.Phase != "idle" || liveState.CWD != state.CWD || liveState.TokenUsage == nil || liveState.TokenUsage.Total.TotalTokens != 123 {
+		t.Fatalf("live state = %#v, ok = %t", liveState, ok)
 	}
 	bad := state
 	bad.ControlToken = "wrong"

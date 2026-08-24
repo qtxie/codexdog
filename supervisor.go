@@ -81,6 +81,7 @@ type supervisor struct {
 	appCmd       *exec.Cmd
 	tuiCmd       *exec.Cmd
 	proxy        proxyRequester
+	usageRPC     proxyRequester
 	proxyServer  *tuiProxy
 	rpc          *jsonRPCClient
 	probe        *providerProbe
@@ -88,13 +89,15 @@ type supervisor struct {
 	processes    *processTree
 	shuttingDown bool
 
-	recoveryCancel     context.CancelFunc
-	recoveryGeneration uint64
-	pendingRecovery    *recoveryContext
-	submittingResume   bool
-	stallCheckInFlight bool
-	stallGeneration    uint64
-	activityTimer      *time.Timer
+	recoveryCancel       context.CancelFunc
+	recoveryGeneration   uint64
+	pendingRecovery      *recoveryContext
+	submittingResume     bool
+	stallCheckInFlight   bool
+	stallGeneration      uint64
+	activityTimer        *time.Timer
+	usageRefreshTimer    *time.Timer
+	usageRefreshInFlight bool
 
 	turnErrors               map[string]turnError
 	turnHadRetryableError    map[string]bool
@@ -220,7 +223,10 @@ func (s *supervisor) Run() (int, error) {
 	if err := rpc.Initialize(context.Background()); err != nil {
 		return s.startupFailure(err)
 	}
+	s.mu.Lock()
 	s.rpc = rpc
+	s.usageRPC = rpc
+	s.mu.Unlock()
 	s.probe = newProviderProbe(rpc, providerProbeOptions{CWD: s.options.CWD, Timeout: s.options.ProbeTimeout, HealthURL: s.options.HealthURL, Model: s.options.ProbeModel})
 
 	control, err := startControlServerWithActions(s.stateSnapshot, s.executeRemoteCommand, func() { s.shutdown("stop requested") })
@@ -238,6 +244,7 @@ func (s *supervisor) Run() (int, error) {
 	if err := s.persist(); err != nil {
 		return s.startupFailure(err)
 	}
+	s.scheduleUsageRefresh(0)
 	s.startStallWatchdog()
 
 	if err := s.startTelegram(); err != nil {
@@ -410,9 +417,7 @@ func (s *supervisor) handleClientMessage(message rpcMessage) {
 	}
 	threadID, _ := readString(message.Params["threadId"])
 	s.mu.Lock()
-	if threadID != "" {
-		s.state.CurrentThreadID = threadID
-	}
+	setCurrentThread(&s.state, threadID)
 	recoveryActive := s.recoveryCancel != nil
 	submitting := s.submittingResume
 	if !submitting && threadID != "" {
@@ -451,6 +456,16 @@ func (s *supervisor) handleServerMessage(message rpcMessage) {
 		return
 	}
 	s.recordAgentManagedCollabThreads(message.Params)
+	if message.Method == "account/rateLimits/updated" {
+		s.scheduleUsageRefresh(0)
+		return
+	}
+	if message.Method == "thread/tokenUsage/updated" {
+		s.handleTokenUsageUpdated(message.Params)
+	}
+	if message.Method == "hook/completed" {
+		s.handleHookCompleted(message.Params)
+	}
 	if message.Method == "thread/started" {
 		s.handleThreadStarted(message.Params)
 		return
@@ -538,8 +553,9 @@ func (s *supervisor) handleThreadStarted(params map[string]any) {
 		s.logger.Log("Observed agent-managed thread " + id + "; direct recovery is disabled")
 		return
 	}
-	s.modifyState(func(state *supervisorState) { state.CurrentThreadID = id })
+	s.modifyState(func(state *supervisorState) { setCurrentThread(state, id) })
 	_ = s.persist()
+	s.scheduleUsageRefresh(0)
 }
 
 func threadDirectInputCapability(threadObject map[string]any) (bool, bool) {
@@ -740,9 +756,7 @@ func (s *supervisor) handleTurnStarted(params map[string]any) {
 	}
 	pausedNow := manualPaused
 	s.modifyState(func(state *supervisorState) {
-		if threadID != "" {
-			state.CurrentThreadID = threadID
-		}
+		setCurrentThread(state, threadID)
 		if ok {
 			state.ActiveTurnID = parsed.ID
 		}
@@ -755,6 +769,7 @@ func (s *supervisor) handleTurnStarted(params map[string]any) {
 	})
 	s.syncStallState()
 	_ = s.persist()
+	s.scheduleUsageRefresh(time.Second)
 	if pausedNow && threadID != "" && ok {
 		s.logger.Log("Turn " + parsed.ID + " started while manually paused; interrupting it")
 		s.requestPausedTurnInterrupt(threadID, parsed.ID)
@@ -824,11 +839,12 @@ func (s *supervisor) recordStartedTurnFromRequest(threadID, turnID string) bool 
 			state.Phase = "running"
 		}
 		state.ActiveTurnID = turnID
-		state.CurrentThreadID = threadID
+		setCurrentThread(state, threadID)
 		state.ProbeAttempt = 0
 		state.ConsecutiveProbeSuccesses = 0
 	})
 	_ = s.persist()
+	s.scheduleUsageRefresh(time.Second)
 	if paused {
 		s.logger.Log("Turn " + turnID + " was returned while manually paused; interrupting it")
 		s.requestPausedTurnInterrupt(threadID, turnID)
@@ -842,6 +858,7 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 	if !threadOK || !turnOK {
 		return
 	}
+	defer s.scheduleUsageRefresh(250 * time.Millisecond)
 	s.mu.Lock()
 	if s.handledTurns[parsed.ID] {
 		s.mu.Unlock()
@@ -867,7 +884,7 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 	delete(s.turnErrors, parsed.ID)
 	hadRetryableError := s.turnHadRetryableError[parsed.ID]
 	delete(s.turnHadRetryableError, parsed.ID)
-	s.state.CurrentThreadID = threadID
+	setCurrentThread(&s.state, threadID)
 	s.state.ActiveTurnID = ""
 	s.mu.Unlock()
 	if waiter != nil {
@@ -1724,7 +1741,7 @@ func (s *supervisor) resumeThread(ctx context.Context, recovery recoveryContext)
 			return errors.New("Codex did not confirm the resumed goal")
 		}
 		s.modifyState(func(state *supervisorState) {
-			state.CurrentThreadID = recovery.ThreadID
+			setCurrentThread(state, recovery.ThreadID)
 			state.ProbeAttempt = 0
 			state.ConsecutiveProbeSuccesses = 0
 		})
@@ -1912,6 +1929,10 @@ func (s *supervisor) shutdown(reason string) {
 		if s.activityTimer != nil {
 			s.activityTimer.Stop()
 			s.activityTimer = nil
+		}
+		if s.usageRefreshTimer != nil {
+			s.usageRefreshTimer.Stop()
+			s.usageRefreshTimer = nil
 		}
 		for _, pending := range s.pendingTerminalErrors {
 			if pending.Timer != nil {

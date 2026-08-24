@@ -40,6 +40,9 @@ func (s *supervisor) executeRemoteCommand(ctx context.Context, command remoteCom
 	defer s.remoteMu.Unlock()
 	switch name {
 	case "status":
+		refreshCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		s.refreshUsageSnapshot(refreshCtx)
+		cancel()
 		return formatRemoteStatus(s.stateSnapshot()), nil
 	case "help":
 		return remoteHelpText, nil
@@ -82,6 +85,7 @@ func formatRemoteStatus(state supervisorState) string {
 	if state.TelegramLastError != "" {
 		lines = append(lines, "Telegram last error: "+state.TelegramLastError)
 	}
+	lines = append(lines, usageStatusLines(state)...)
 	return strings.Join(lines, "\n")
 }
 
@@ -362,7 +366,7 @@ func (s *supervisor) startContinuation(ctx context.Context, threadID, prompt str
 				return errors.New("Codex did not confirm the resumed goal")
 			}
 			s.modifyState(func(state *supervisorState) {
-				state.CurrentThreadID = threadID
+				setCurrentThread(state, threadID)
 				state.Phase = "running"
 				state.ActiveTurnID = ""
 				state.ProbeAttempt = 0

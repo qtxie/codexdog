@@ -123,7 +123,9 @@ func (w *stallWatchdog) Observe(message rpcMessage, now time.Time) stallObservat
 			}
 		}
 	case "hook/started":
-		a.BlockingItems[hookKey(message.Params)] = "hook"
+		if !hookIsAsync(message.Params) {
+			a.BlockingItems[hookKey(message.Params)] = "hook"
+		}
 	case "hook/completed":
 		delete(a.BlockingItems, hookKey(message.Params))
 	}
@@ -286,4 +288,12 @@ func hookKey(params map[string]any) string {
 		}
 	}
 	return fmt.Sprintf("hook:%s", "active")
+}
+
+func hookIsAsync(params map[string]any) bool {
+	if run, ok := asObject(params["run"]); ok {
+		mode, _ := readString(run["executionMode"])
+		return mode == "async"
+	}
+	return false
 }

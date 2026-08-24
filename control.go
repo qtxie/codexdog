@@ -111,7 +111,34 @@ func (c *controlServer) Close() error {
 }
 
 func queryControl(state supervisorState) bool {
-	return controlRequest(state, http.MethodGet, "/status", time.Second)
+	_, ok := queryControlState(state)
+	return ok
+}
+
+func queryControlState(state supervisorState) (supervisorState, bool) {
+	if state.ControlPort == 0 || state.ControlToken == "" {
+		return supervisorState{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/status", state.ControlPort), nil)
+	if err != nil {
+		return supervisorState{}, false
+	}
+	request.Header.Set("Authorization", "Bearer "+state.ControlToken)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return supervisorState{}, false
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return supervisorState{}, false
+	}
+	var live supervisorState
+	if err := json.NewDecoder(response.Body).Decode(&live); err != nil {
+		return supervisorState{}, false
+	}
+	return live, true
 }
 
 func requestStop(state supervisorState) bool {

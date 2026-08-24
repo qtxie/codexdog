@@ -59,7 +59,10 @@ func run(argv []string) (int, error) {
 			fmt.Printf("No supervisor state for %s\n", args.Options.CWD)
 			return 1, nil
 		}
-		live := queryControl(state)
+		liveState, live := queryControlState(state)
+		if live {
+			state = liveState
+		}
 		visible := publicState(state, live)
 		if args.JSON {
 			data, err := json.MarshalIndent(visible, "", "  ")
@@ -82,6 +85,9 @@ func run(argv []string) (int, error) {
 			fmt.Printf("Manual pause: %s\n", yesNo(state.ManualPaused))
 			fmt.Printf("Telegram control: %s\n", yesNo(state.TelegramEnabled))
 			fmt.Printf("Last error: %s\n", valueOrDash(state.LastError))
+			for _, line := range usageStatusLines(state) {
+				fmt.Println(line)
+			}
 			fmt.Printf("Updated: %s\n", state.UpdatedAt)
 		}
 		if live {
