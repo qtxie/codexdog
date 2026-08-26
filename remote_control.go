@@ -25,6 +25,7 @@ const remoteHelpText = `Commands:
 /goal - show the current goal
 /goal pause|resume - change the current goal status
 /goal set TEXT - replace the current goal objective
+/queue - manage queued submissions for the current thread
 /stop confirm - stop codexdog and the Codex processes it owns
 /help - show this help`
 
@@ -54,6 +55,8 @@ func (s *supervisor) executeRemoteCommand(ctx context.Context, command remoteCom
 		return s.remoteResume(ctx)
 	case "goal":
 		return s.remoteGoal(ctx, strings.TrimSpace(command.Text))
+	case "queue":
+		return s.remoteQueue(ctx, strings.TrimSpace(command.Text))
 	case "stop":
 		if !command.Confirm && !strings.EqualFold(strings.TrimSpace(command.Text), "confirm") {
 			return "Stopping requires confirmation. Send /stop confirm.", nil
@@ -70,7 +73,13 @@ func formatRemoteStatus(state supervisorState) string {
 		"Codexdog status",
 		"Phase: " + valueOrDash(state.Phase),
 		"Workspace: " + valueOrDash(state.CWD),
+		"Thread directory: " + valueOrDash(state.EffectiveCWD),
+		"Codex: " + valueOrDash(state.CodexVersion),
 		"Thread: " + valueOrDash(state.CurrentThreadID),
+		"Permission profile: " + valueOrDash(state.ActivePermissionProfile),
+		"Sandbox: " + valueOrDash(state.SandboxPolicy),
+		"Model: " + valueOrDash(state.Model),
+		"Primary client: " + valueOrDash(formatClientIdentity(state.PrimaryClient, state.PrimaryClientVersion)),
 		"Turn: " + valueOrDash(state.ActiveTurnID),
 		"Manual pause: " + yesNo(state.ManualPaused),
 		"Telegram control: " + yesNo(state.TelegramEnabled),
@@ -377,13 +386,12 @@ func (s *supervisor) startContinuation(ctx context.Context, threadID, prompt str
 			return nil
 		}
 	}
-	if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": threadID, "cwd": s.options.CWD}); err != nil {
+	if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": threadID}); err != nil {
 		return fmt.Errorf("resume thread: %w", err)
 	}
 	params := map[string]any{
 		"threadId": threadID,
 		"input":    []any{map[string]any{"type": "text", "text": prompt}},
-		"cwd":      s.options.CWD,
 	}
 	if clientID != "" {
 		params["clientUserMessageId"] = "codexdog:" + clientID + ":" + fmt.Sprintf("%d", time.Now().UnixNano())

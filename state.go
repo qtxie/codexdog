@@ -13,9 +13,24 @@ import (
 )
 
 type supervisorState struct {
-	Version                        int                       `json:"version"`
-	PID                            int                       `json:"pid"`
+	Version int `json:"version"`
+	PID     int `json:"pid"`
+	// CWD is the workspace used to identify this supervisor's state file. It
+	// intentionally remains stable when a thread changes directory with /cd.
 	CWD                            string                    `json:"cwd"`
+	EffectiveCWD                   string                    `json:"effectiveCwd,omitempty"`
+	CodexVersion                   string                    `json:"codexVersion,omitempty"`
+	SessionID                      string                    `json:"sessionId,omitempty"`
+	ProjectID                      string                    `json:"projectId,omitempty"`
+	ActivePermissionProfile        string                    `json:"activePermissionProfile,omitempty"`
+	ActivePermissionProfileExtends string                    `json:"activePermissionProfileExtends,omitempty"`
+	ApprovalPolicy                 string                    `json:"approvalPolicy,omitempty"`
+	ApprovalsReviewer              string                    `json:"approvalsReviewer,omitempty"`
+	SandboxPolicy                  string                    `json:"sandboxPolicy,omitempty"`
+	Model                          string                    `json:"model,omitempty"`
+	ModelProvider                  string                    `json:"modelProvider,omitempty"`
+	PrimaryClient                  string                    `json:"primaryClient,omitempty"`
+	PrimaryClientVersion           string                    `json:"primaryClientVersion,omitempty"`
 	Phase                          string                    `json:"phase"`
 	AppServerPort                  int                       `json:"appServerPort,omitempty"`
 	ProxyPort                      int                       `json:"proxyPort,omitempty"`
@@ -46,6 +61,8 @@ type supervisorState struct {
 	RateLimitResetCreditsAvailable *int64                    `json:"rateLimitResetCreditsAvailable,omitempty"`
 	UsageUpdatedAt                 string                    `json:"usageUpdatedAt,omitempty"`
 	UsageLastError                 string                    `json:"usageLastError,omitempty"`
+	QueueUpdatedAt                 string                    `json:"queueUpdatedAt,omitempty"`
+	QueueClientMessageIDs          map[string]string         `json:"queueClientMessageIds,omitempty"`
 	UpdatedAt                      string                    `json:"updatedAt"`
 	StoppedReason                  string                    `json:"stoppedReason,omitempty"`
 }

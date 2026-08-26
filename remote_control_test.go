@@ -123,6 +123,32 @@ func TestRemoteResumeReactivatesGoalWithoutPrompt(t *testing.T) {
 	}
 }
 
+func TestStartContinuationPreservesThreadSettings(t *testing.T) {
+	cwd := t.TempDir()
+	s := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))
+	proxy := &mockProxy{request: func(_ context.Context, method string, params map[string]any) (any, error) {
+		if _, exists := params["cwd"]; exists {
+			return nil, fmt.Errorf("%s unexpectedly overrides cwd: %#v", method, params)
+		}
+		switch method {
+		case "thread/resume":
+			return map[string]any{}, nil
+		case "turn/start":
+			return map[string]any{"turn": map[string]any{"id": "continued-turn", "status": "inProgress"}}, nil
+		default:
+			return nil, fmt.Errorf("unexpected method %s", method)
+		}
+	}}
+	s.proxy = proxy
+	s.modifyState(func(state *supervisorState) { state.EffectiveCWD = `D:\changed\directory` })
+	if err := s.startContinuation(context.Background(), "thread-1", "continue", false, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(proxy.methods()); got != "[thread/resume turn/start]" {
+		t.Fatalf("methods = %s", got)
+	}
+}
+
 func TestTurnStartedWhilePausedIsInterrupted(t *testing.T) {
 	cwd := t.TempDir()
 	s := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))

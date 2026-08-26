@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +18,12 @@ type controlServer struct {
 	Port   int
 	Token  string
 	server *http.Server
+}
+
+type controlCommandResponse struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+	Error   string `json:"error"`
 }
 
 func startControlServer(state func() supervisorState, stop func()) (*controlServer, error) {
@@ -162,4 +169,38 @@ func controlRequest(state supervisorState, method, path string, timeout time.Dur
 	}
 	defer response.Body.Close()
 	return response.StatusCode >= 200 && response.StatusCode <= 299
+}
+
+func requestControlCommand(state supervisorState, command remoteCommand) (string, error) {
+	if state.ControlPort == 0 || state.ControlToken == "" {
+		return "", errors.New("the Codexdog control server is unavailable")
+	}
+	body, err := json.Marshal(command)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/command", state.ControlPort), strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+state.ControlToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	var result controlCommandResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if response.StatusCode < 200 || response.StatusCode > 299 || !result.OK {
+		if result.Error != "" {
+			return "", errors.New(result.Error)
+		}
+		return "", fmt.Errorf("control command failed with HTTP %d", response.StatusCode)
+	}
+	return result.Message, nil
 }

@@ -53,9 +53,16 @@ func (c *jsonRPCClient) Connect(ctx context.Context) error {
 }
 
 func (c *jsonRPCClient) Initialize(ctx context.Context) error {
+	return c.InitializeWithOptions(ctx, "codexdog", false)
+}
+
+func (c *jsonRPCClient) InitializeWithOptions(ctx context.Context, clientName string, experimentalAPI bool) error {
+	if clientName == "" {
+		clientName = "codexdog"
+	}
 	_, err := c.Request(ctx, "initialize", map[string]any{
-		"clientInfo":   map[string]any{"name": "codexdog", "title": "Codexdog", "version": version},
-		"capabilities": map[string]any{"experimentalApi": false},
+		"clientInfo":   map[string]any{"name": clientName, "title": "Codexdog", "version": version},
+		"capabilities": map[string]any{"experimentalApi": experimentalAPI},
 	})
 	if err != nil {
 		return err
@@ -179,6 +186,10 @@ func (c *jsonRPCClient) readLoop() {
 				continue
 			}
 		}
+		if message.Method != "" && key != "" {
+			c.rejectServerRequest(message)
+			continue
+		}
 		if message.Method != "" {
 			c.mu.Lock()
 			handlers := make([]notificationHandler, 0, len(c.handlers))
@@ -191,6 +202,22 @@ func (c *jsonRPCClient) readLoop() {
 			}
 		}
 	}
+}
+
+// Direct app-server clients are used only for health, usage, and explicit
+// queue operations. They do not own an interactive approval surface, so
+// acknowledge unexpected server requests with an explicit JSON-RPC error
+// rather than leaving the app-server waiting indefinitely.
+func (c *jsonRPCClient) rejectServerRequest(message rpcMessage) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = c.writeJSON(ctx, map[string]any{
+		"id": message.ID,
+		"error": map[string]any{
+			"code":    -32601,
+			"message": "Codexdog direct client does not handle server requests; use the primary TUI",
+		},
+	})
 }
 
 func (c *jsonRPCClient) removePending(key string) {

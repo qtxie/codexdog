@@ -220,6 +220,77 @@ func TestSupervisorSkipsDirectResumeForAgentManagedThread(t *testing.T) {
 	}
 }
 
+func TestThreadSettingsUpdatePreservesWorkspaceIdentity(t *testing.T) {
+	workspace := t.TempDir()
+	s := newSupervisor(testSupervisorOptions(workspace), newStateStore(t.TempDir(), workspace))
+	s.modifyState(func(state *supervisorState) { state.CurrentThreadID = "thread-1" })
+	s.handleServerMessage(rpcMessage{Method: "thread/settings/updated", Params: map[string]any{
+		"threadId": "thread-1",
+		"threadSettings": map[string]any{
+			"cwd":                     `D:\changed\directory`,
+			"activePermissionProfile": map[string]any{"id": "team-safe", "extends": ":workspace"},
+			"approvalPolicy":          "on-request",
+			"approvalsReviewer":       "user",
+			"sandboxPolicy":           map[string]any{"type": "workspaceWrite"},
+			"model":                   "gpt-5.6-sol",
+			"modelProvider":           "openai",
+		},
+	}})
+	state := s.stateSnapshot()
+	if state.CWD != workspace || state.EffectiveCWD != `D:\changed\directory` {
+		t.Fatalf("workspace identity/settings = %#v", state)
+	}
+	if state.ActivePermissionProfile != "team-safe" || state.ActivePermissionProfileExtends != ":workspace" || state.ApprovalPolicy != "on-request" || state.ApprovalsReviewer != "user" || state.SandboxPolicy != "workspaceWrite" || state.Model != "gpt-5.6-sol" || state.ModelProvider != "openai" {
+		t.Fatalf("thread settings = %#v", state)
+	}
+	s.handleServerMessage(rpcMessage{Method: "thread/settings/updated", Params: map[string]any{
+		"threadId": "thread-1",
+		"threadSettings": map[string]any{
+			"activePermissionProfile": nil,
+		},
+	}})
+	state = s.stateSnapshot()
+	if state.ActivePermissionProfile != "" || state.ActivePermissionProfileExtends != "" {
+		t.Fatalf("cleared permission profile remained in state: %#v", state)
+	}
+}
+
+func TestSupervisorEventLoopIgnoresSecondaryProxyConnection(t *testing.T) {
+	workspace := t.TempDir()
+	s := newSupervisor(testSupervisorOptions(workspace), newStateStore(t.TempDir(), workspace))
+	s.proxyServer = &tuiProxy{
+		bridges: map[string]*proxyBridge{
+			"primary":   {id: "primary"},
+			"secondary": {id: "secondary"},
+		},
+		primary: "primary",
+	}
+	go s.eventLoop()
+	defer close(s.done)
+
+	s.enqueue(false, "secondary", rpcMessage{Method: "thread/settings/updated", Params: map[string]any{
+		"threadId": "secondary-thread",
+		"threadSettings": map[string]any{
+			"cwd":   `D:\secondary\directory`,
+			"model": "secondary-model",
+		},
+	}})
+	s.enqueue(false, "primary", rpcMessage{Method: "thread/settings/updated", Params: map[string]any{
+		"threadId": "primary-thread",
+		"threadSettings": map[string]any{
+			"cwd": workspace,
+		},
+	}})
+
+	waitFor(t, func() bool {
+		return s.stateSnapshot().CurrentThreadID == "primary-thread"
+	})
+	state := s.stateSnapshot()
+	if state.EffectiveCWD != workspace || state.Model != "" {
+		t.Fatalf("secondary proxy event changed supervisor state: %#v", state)
+	}
+}
+
 func TestSupervisorIdentifiesAgentThreadFromCollaborationItem(t *testing.T) {
 	cwd := t.TempDir()
 	supervisor := newSupervisor(testSupervisorOptions(cwd), newStateStore(t.TempDir(), cwd))

@@ -15,7 +15,7 @@ Codex processes remain alive while Codexdog recovers the stopped turn.
 - Codex CLI login and provider configuration that already work without
   Codexdog.
 - Codex CLI `app-server` and `--remote` support. Codexdog currently targets the
-  app-server schema shipped with Codex CLI 0.148.0.
+  app-server schema shipped with Codex CLI 0.149.1.
 - Go 1.24 or newer only when building from source.
 
 Run these checks before using Codexdog:
@@ -23,12 +23,17 @@ Run these checks before using Codexdog:
 ```text
 codex --version
 codexdog version
+codexdog doctor
+codexdog schema-check
 codexdog smoke
 ```
 
-`smoke` starts the installed app-server and validates the local protocol without
-making a model request. `canary` also makes one minimal request through the
-configured provider.
+`doctor` checks the installed Codex version and prints a compact redacted
+diagnostic summary. `schema-check` regenerates the installed stable and
+experimental schemas and checks the fields Codexdog uses. `smoke` starts the
+installed app-server and validates the local protocol without making a model
+request. `canary`, or `doctor --canary`, makes one minimal request through the
+configured provider and is an explicit opt-in.
 
 ## Install a GitHub Actions build
 
@@ -138,13 +143,19 @@ codexdog stop -C /path/to/project
 Codexdog identifies a supervisor by the absolute workspace path. Use the same
 `-C` value for `start`, `status`, and `stop`.
 
-On Codex CLI 0.148.0, status also reports the current thread's input, cached,
+On Codex CLI 0.149.1, status also reports the current thread's input, cached,
 cache-write, output, reasoning, and total tokens; estimated credit and USD use;
 account credit balance; and primary/secondary rate-limit windows. `--json`
 exposes these as `tokenUsage`, `usageEstimate`, `accountUsage`, and `rateLimits`.
 Some account types and custom providers do not return every billing field. In
 that case Codexdog keeps supervising normally and records the read problem in
 `usageLastError`.
+
+Status also records the active thread directory, session/project IDs, permission
+profile, approval policy, sandbox policy, model, and provider. `-C` remains the
+stable workspace and state-file identity. When Codex changes directory with
+`/cd`, `effectiveCwd` tracks the thread's actual directory and recovery uses it
+without changing the workspace key.
 
 ## Pass settings and arguments to Codex
 
@@ -175,6 +186,32 @@ environment and forwards its `-c` overrides to both Codex child processes.
 Options such as `danger-full-access` retain their normal Codex meaning and risk.
 Codexdog does not add a safety boundary around the selected Codex sandbox or
 approval policy.
+
+## Native agents and queued work
+
+The proxy pins the spawned Codex TUI as the primary control connection. This
+lets the native agents dashboard connect to the same supervised session without
+becoming the destination for recovery or remote-control requests:
+
+```text
+codexdog agents -C /path/to/project -- --no-alt-screen
+```
+
+The experimental app-server queue is exposed only through explicit commands and
+requires a live Codexdog supervisor. It is separate from an immediate remote
+prompt:
+
+```text
+codexdog queue -C /path/to/project list
+codexdog queue -C /path/to/project add "review the current diff after this turn"
+codexdog queue -C /path/to/project update QUEUE_ID "run focused tests next"
+codexdog queue -C /path/to/project reorder QUEUE_ID FIRST_ID SECOND_ID
+codexdog queue -C /path/to/project delete QUEUE_ID
+codexdog queue -C /path/to/project start QUEUE_ID
+```
+
+Queue commands use Codex 0.149.1's experimental queue API. Submission client
+message IDs are persisted so an operator can trace a queued request in state.
 
 ## Provider recovery
 
@@ -308,6 +345,7 @@ Available bot commands:
 | `/goal pause` | Pause the saved goal. |
 | `/goal resume` | Reactivate the saved goal without a synthetic prompt. |
 | `/goal set TEXT` | Replace the goal objective. |
+| `/queue ACTION ...` | List, add, update, delete, reorder, or explicitly start experimental queued submissions. |
 | `/stop confirm` | Stop Codexdog and the Codex processes it owns. |
 | `/help` | Show the command list. |
 
@@ -329,8 +367,13 @@ that session. Do not expose the bot token, state file, or control token.
 | `codexdog start` | Start the supervisor, app-server, proxy, and Codex TUI. |
 | `codexdog status` | Read live state for the selected workspace. |
 | `codexdog stop` | Ask the selected workspace supervisor to shut down. |
+| `codexdog doctor` | Check installed Codex compatibility and compact diagnostics without a model request. |
+| `codexdog doctor --canary` | Run diagnostics plus one explicit provider canary. |
+| `codexdog schema-check` | Regenerate and validate the installed stable and experimental app-server schemas. |
 | `codexdog smoke` | Validate app-server and proxy compatibility without a model turn. |
 | `codexdog canary` | Run the smoke checks plus one provider model turn. |
+| `codexdog agents` | Open Codex's native agents dashboard against the supervised session. |
+| `codexdog queue ACTION ...` | Manage explicit experimental queued submissions on a live supervisor. |
 | `codexdog version` | Print the Codexdog version. |
 | `codexdog help` | Print CLI usage and option defaults. |
 
@@ -440,7 +483,7 @@ and the workspace supervisor log.
 
 ### Usage, cost, or rate limits are missing
 
-These fields require Codex CLI 0.148.0 and depend on the signed-in account and
+These fields require Codex CLI 0.149.1 and depend on the signed-in account and
 billing route. Inspect `usageLastError` with `codexdog status --json`. A missing
 USD estimate or credit balance can be a valid backend response and does not
 indicate that recovery or the watchdog is broken.
@@ -450,11 +493,13 @@ indicate that recovery or the watchdog is broken.
 Run:
 
 ```text
+codexdog doctor
+codexdog schema-check
 codexdog smoke
-codexdog canary
 ```
 
-An app-server schema or transport change may require a Codexdog update even when
+Use `codexdog doctor --canary` only when one provider request is acceptable. An
+app-server schema or transport change may require a Codexdog update even when
 the interactive Codex command still works by itself.
 
 ## Build workflow behavior
@@ -468,3 +513,9 @@ After all target builds succeed for a pushed version tag, the workflow verifies
 the packaged artifacts against their SHA-256 sidecars and publishes a GitHub
 Release with generated release notes. The three archives and their checksum
 files are attached to the release. Binaries are not signed or notarized.
+
+`.github/workflows/codex-compatibility.yml` separately runs unit tests, schema
+validation, and the no-model-turn smoke test against pinned Codex 0.149.1. A
+scheduled `latest` job is allowed to fail so upstream app-server changes are
+visible before they become release blockers. The build workflow also runs the
+Go race detector on Linux.

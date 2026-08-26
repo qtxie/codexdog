@@ -29,12 +29,14 @@ type proxyRequest struct {
 }
 
 type proxyBridge struct {
-	id         string
-	downstream *websocket.Conn
-	upstream   *websocket.Conn
-	downMu     sync.Mutex
-	upMu       sync.Mutex
-	closed     atomic.Bool
+	id            string
+	downstream    *websocket.Conn
+	upstream      *websocket.Conn
+	clientName    string
+	clientVersion string
+	downMu        sync.Mutex
+	upMu          sync.Mutex
+	closed        atomic.Bool
 }
 
 type tuiProxy struct {
@@ -43,7 +45,7 @@ type tuiProxy struct {
 	server      *http.Server
 	mu          sync.Mutex
 	bridges     map[string]*proxyBridge
-	lastActive  string
+	primary     string
 	pending     map[string]proxyRequest
 	serverObs   []proxyObserver
 	clientObs   []proxyObserver
@@ -79,9 +81,9 @@ func (p *tuiProxy) OnClientMessage(observer proxyObserver) {
 }
 
 func (p *tuiProxy) Request(ctx context.Context, method string, params map[string]any) (any, error) {
-	bridge := p.activeBridge()
+	bridge := p.primaryBridge()
 	if bridge == nil {
-		return nil, errors.New("no active Codex TUI connection is available")
+		return nil, errors.New("the primary Codex TUI connection is unavailable")
 	}
 	id := fmt.Sprintf("codexdog-proxy-%d", p.nextID.Add(1))
 	idJSON, _ := json.Marshal(id)
@@ -157,7 +159,12 @@ func (p *tuiProxy) accept(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	p.bridges[bridge.id] = bridge
-	p.lastActive = bridge.id
+	// The first connection is the TUI spawned by the supervisor. It remains
+	// primary for the proxy lifetime, so a dashboard or queue client cannot
+	// become the recovery/control path by sending a later message.
+	if p.primary == "" {
+		p.primary = bridge.id
+	}
 	p.mu.Unlock()
 
 	done := make(chan struct{}, 2)
@@ -174,11 +181,18 @@ func (p *tuiProxy) forwardDownstream(bridge *proxyBridge) {
 		if err != nil {
 			return
 		}
+		message, parsed := parseRPC(data)
+		if parsed && message.Method == "initialize" {
+			p.recordClientInfo(bridge.id, message.Params)
+		}
 		p.mu.Lock()
-		p.lastActive = bridge.id
 		observers := append([]proxyObserver(nil), p.clientObs...)
 		p.mu.Unlock()
-		p.observe(data, bridge.id, observers)
+		if parsed {
+			for _, observer := range observers {
+				observer(message, bridge.id)
+			}
+		}
 		if err := bridge.writeUpstream(context.Background(), typeName, data); err != nil {
 			return
 		}
@@ -229,26 +243,50 @@ func (p *tuiProxy) observe(data []byte, connectionID string, observers []proxyOb
 	}
 }
 
-func (p *tuiProxy) activeBridge() *proxyBridge {
+func (p *tuiProxy) primaryBridge() *proxyBridge {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if bridge := p.bridges[p.lastActive]; bridge != nil && !bridge.closed.Load() {
+	if bridge := p.bridges[p.primary]; bridge != nil && !bridge.closed.Load() {
 		return bridge
 	}
-	for id, bridge := range p.bridges {
-		if !bridge.closed.Load() {
-			p.lastActive = id
-			return bridge
-		}
-	}
 	return nil
+}
+
+func (p *tuiProxy) IsPrimary(connectionID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return connectionID != "" && p.primary == connectionID && p.bridges[connectionID] != nil
+}
+
+func (p *tuiProxy) PrimaryClientInfo() (string, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if bridge := p.bridges[p.primary]; bridge != nil {
+		return bridge.clientName, bridge.clientVersion
+	}
+	return "", ""
+}
+
+func (p *tuiProxy) recordClientInfo(connectionID string, params map[string]any) {
+	info, ok := asObject(params["clientInfo"])
+	if !ok {
+		return
+	}
+	name, _ := readString(info["name"])
+	clientVersion, _ := readString(info["version"])
+	p.mu.Lock()
+	if bridge := p.bridges[connectionID]; bridge != nil {
+		bridge.clientName = name
+		bridge.clientVersion = clientVersion
+	}
+	p.mu.Unlock()
 }
 
 func (p *tuiProxy) removeBridge(connectionID string) {
 	p.mu.Lock()
 	delete(p.bridges, connectionID)
-	if p.lastActive == connectionID {
-		p.lastActive = ""
+	if p.primary == connectionID {
+		p.primary = ""
 	}
 	p.mu.Unlock()
 	p.rejectPending(errors.New("Codex TUI connection closed"), connectionID)

@@ -21,10 +21,12 @@ const version = "0.2.0"
 var defaultBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 60 * time.Second}
 
 type parsedArguments struct {
-	Command   string
-	StateRoot string
-	JSON      bool
-	Options   supervisorOptions
+	Command      string
+	CommandArgs  []string
+	StateRoot    string
+	JSON         bool
+	DoctorCanary bool
+	Options      supervisorOptions
 }
 
 func main() {
@@ -72,10 +74,20 @@ func run(argv []string) (int, error) {
 			fmt.Printf("%s\n", data)
 		} else {
 			fmt.Printf("Workspace: %s\n", state.CWD)
+			fmt.Printf("Thread directory: %s\n", valueOrDash(state.EffectiveCWD))
+			fmt.Printf("Codex: %s\n", valueOrDash(state.CodexVersion))
 			fmt.Printf("Live: %s\n", yesNo(live))
 			fmt.Printf("Phase: %s\n", state.Phase)
 			fmt.Printf("Thread: %s\n", valueOrDash(state.CurrentThreadID))
+			fmt.Printf("Session: %s\n", valueOrDash(state.SessionID))
+			fmt.Printf("Project: %s\n", valueOrDash(state.ProjectID))
 			fmt.Printf("Turn: %s\n", valueOrDash(state.ActiveTurnID))
+			fmt.Printf("Permission profile: %s\n", valueOrDash(state.ActivePermissionProfile))
+			fmt.Printf("Approval policy: %s\n", valueOrDash(state.ApprovalPolicy))
+			fmt.Printf("Sandbox: %s\n", valueOrDash(state.SandboxPolicy))
+			fmt.Printf("Model: %s\n", valueOrDash(state.Model))
+			fmt.Printf("Model provider: %s\n", valueOrDash(state.ModelProvider))
+			fmt.Printf("Primary client: %s\n", valueOrDash(formatClientIdentity(state.PrimaryClient, state.PrimaryClientVersion)))
 			fmt.Printf("Automatic resumes: %d\n", state.AutomaticResumeCount)
 			fmt.Printf("Stall resumes: %d\n", state.StallRecoveryCount)
 			fmt.Printf("Last turn activity: %s\n", valueOrDash(state.LastTurnActivityAt))
@@ -84,6 +96,7 @@ func run(argv []string) (int, error) {
 			fmt.Printf("Terminal error suspected: %s\n", valueOrDash(state.TerminalErrorSuspectedAt))
 			fmt.Printf("Manual pause: %s\n", yesNo(state.ManualPaused))
 			fmt.Printf("Telegram control: %s\n", yesNo(state.TelegramEnabled))
+			fmt.Printf("Queue updated: %s\n", valueOrDash(state.QueueUpdatedAt))
 			fmt.Printf("Last error: %s\n", valueOrDash(state.LastError))
 			for _, line := range usageStatusLines(state) {
 				fmt.Println(line)
@@ -103,6 +116,14 @@ func run(argv []string) (int, error) {
 		return 0, nil
 	case "smoke", "canary":
 		return runProtocolSmoke(args.Options, args.Command == "canary")
+	case "doctor":
+		return runDoctor(args.Options, store, args.JSON, args.DoctorCanary)
+	case "schema-check":
+		return runSchemaCheck(args.Options, args.JSON)
+	case "agents":
+		return runAgents(args.Options, store)
+	case "queue":
+		return runQueueCommand(args, store)
 	case "start":
 		if err := validateTelegramOptions(args.Options); err != nil {
 			return 1, err
@@ -124,7 +145,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	index := 0
 	if len(argv) > 0 {
 		switch argv[0] {
-		case "start", "status", "stop", "smoke", "canary":
+		case "start", "status", "stop", "smoke", "canary", "doctor", "schema-check", "agents", "queue":
 			command = argv[0]
 			index = 1
 		case "help", "--help", "-h":
@@ -173,6 +194,8 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	}
 	telegramTokenFile := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_TOKEN_FILE"))
 	jsonOutput := false
+	commandArgs := []string{}
+	doctorCanary := false
 	valueAfter := func(flag string) (string, error) {
 		index++
 		if index >= len(argv) || argv[index] == "" {
@@ -183,7 +206,11 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	for ; index < len(argv); index++ {
 		arg := argv[index]
 		if arg == "--" {
-			options.TUIArgs = append([]string(nil), argv[index+1:]...)
+			if command == "queue" {
+				commandArgs = append(commandArgs, argv[index+1:]...)
+			} else {
+				options.TUIArgs = append([]string(nil), argv[index+1:]...)
+			}
 			break
 		}
 		switch arg {
@@ -372,9 +399,18 @@ func parseArguments(argv []string) (parsedArguments, error) {
 			options.CodexConfig = append(options.CodexConfig, value)
 		case "--json":
 			jsonOutput = true
+		case "--canary":
+			if command != "doctor" {
+				return parsedArguments{}, fmt.Errorf("%s is only supported by doctor", arg)
+			}
+			doctorCanary = true
 		case "-h", "--help":
 			command = "help"
 		default:
+			if command == "queue" {
+				commandArgs = append(commandArgs, arg)
+				continue
+			}
 			return parsedArguments{}, fmt.Errorf("unknown option %s. Put Codex TUI arguments after --", arg)
 		}
 	}
@@ -404,7 +440,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	options.TelegramAllowedChats = uniqueInt64(options.TelegramAllowedChats)
 	options.TelegramAllowedUsers = uniqueInt64(options.TelegramAllowedUsers)
 	options.TelegramStatePath = filepath.Join(absoluteRoot, "telegram-"+workspaceKey(options.CWD)+".json")
-	return parsedArguments{Command: command, StateRoot: absoluteRoot, JSON: jsonOutput, Options: options}, nil
+	return parsedArguments{Command: command, CommandArgs: commandArgs, StateRoot: absoluteRoot, JSON: jsonOutput, DoctorCanary: doctorCanary, Options: options}, nil
 }
 
 func parseTelegramID(value, flag string) (int64, error) {
@@ -484,6 +520,10 @@ Usage:
   codexdog stop [options]
   codexdog smoke [options]
   codexdog canary [options]
+  codexdog doctor [options] [--canary]
+  codexdog schema-check [options]
+  codexdog agents [options] [-- CODEX_AGENTS_ARGS...]
+  codexdog queue ACTION [ARGS...] [options]
 
 Options:
   -C, --cwd DIR               Workspace to open (default: current directory)
@@ -509,7 +549,8 @@ Options:
                                Long-poll timeout from 1 to 50 seconds (default: 30)
   --telegram-no-notify         Disable unsolicited lifecycle notifications
   --state-dir DIR             State and log directory
-  --json                      JSON output for status
+  --json                      JSON output for status, doctor, schema-check, or queue
+  --canary                    Run a provider-consuming canary as part of doctor
   -h, --help                  Show help
 
 Examples:
@@ -517,6 +558,9 @@ Examples:
   codexdog start -C . --stall-timeout-ms 600000
   codexdog start -C . -- resume -s danger-full-access
   codexdog status -C . --json
+  codexdog doctor -C .
+  codexdog agents -C . -- --no-alt-screen
+  codexdog queue add "review the current diff" -C .
   $env:CODEXDOG_TELEGRAM_BOT_TOKEN = "..."
   codexdog start -C . --telegram-chat-id 123456789
 `)
@@ -535,7 +579,21 @@ func valueOrDash(value string) string {
 	return value
 }
 
+func formatClientIdentity(name, clientVersion string) string {
+	if name == "" {
+		return ""
+	}
+	if clientVersion == "" {
+		return name
+	}
+	return name + " " + clientVersion
+}
+
 func runProtocolSmoke(options supervisorOptions, canary bool) (int, error) {
+	return runProtocolSmokeWithOutput(options, canary, true)
+}
+
+func runProtocolSmokeWithOutput(options supervisorOptions, canary, output bool) (int, error) {
 	port, err := getFreePort()
 	if err != nil {
 		return 1, err
@@ -645,8 +703,12 @@ func runProtocolSmoke(options supervisorOptions, canary bool) (int, error) {
 			}
 			return 1, fmt.Errorf("provider canary failed: %s", formatFailure(*result.Failure))
 		}
-		fmt.Println("Configured provider canary passed.")
+		if output {
+			fmt.Println("Configured provider canary passed.")
+		}
 	}
-	fmt.Println("Codex app-server protocol smoke test passed.")
+	if output {
+		fmt.Println("Codex app-server protocol smoke test passed.")
+	}
 	return 0, nil
 }

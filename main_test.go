@@ -73,6 +73,23 @@ func TestParseArgumentsRequiresSeparatorForTUIArguments(t *testing.T) {
 	}
 }
 
+func TestParseArgumentsSupportsDoctorAndQueue(t *testing.T) {
+	doctor, err := parseArguments([]string{"doctor", "--canary", "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doctor.Command != "doctor" || !doctor.DoctorCanary || !doctor.JSON {
+		t.Fatalf("doctor arguments = %#v", doctor)
+	}
+	queue, err := parseArguments([]string{"queue", "add", "review the diff", "-C", "."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queue.Command != "queue" || fmt.Sprint(queue.CommandArgs) != "[add review the diff]" {
+		t.Fatalf("queue arguments = %#v", queue)
+	}
+}
+
 func TestParseArgumentsRejectsInvalidTimeout(t *testing.T) {
 	if _, err := parseArguments([]string{"start", "--stall-timeout-ms", "-1"}); err == nil {
 		t.Fatal("negative stall timeout was accepted")

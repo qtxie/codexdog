@@ -66,8 +66,9 @@ type proxyRequester interface {
 }
 
 type supervisorEvent struct {
-	client  bool
-	message rpcMessage
+	client       bool
+	connectionID string
+	message      rpcMessage
 }
 
 type supervisor struct {
@@ -82,8 +83,10 @@ type supervisor struct {
 	tuiCmd       *exec.Cmd
 	proxy        proxyRequester
 	usageRPC     proxyRequester
+	queueRPC     proxyRequester
 	proxyServer  *tuiProxy
 	rpc          *jsonRPCClient
+	queueClient  *jsonRPCClient
 	probe        *providerProbe
 	control      *controlServer
 	processes    *processTree
@@ -125,7 +128,7 @@ func newSupervisor(options supervisorOptions, store *stateStore) *supervisor {
 		store:                    store,
 		logger:                   newLogger(store.LogPath),
 		watchdog:                 newStallWatchdog(stallWatchdogOptions{StallTimeout: options.StallTimeout, ConfirmTimeout: options.StallConfirm, ToolStallTimeout: options.ToolStallTimeout}),
-		state:                    supervisorState{Version: 1, PID: os.Getpid(), CWD: options.CWD, Phase: "starting", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)},
+		state:                    supervisorState{Version: 2, PID: os.Getpid(), CWD: options.CWD, EffectiveCWD: options.CWD, Phase: "starting", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)},
 		turnErrors:               map[string]turnError{},
 		turnHadRetryableError:    map[string]bool{},
 		pendingTerminalErrors:    map[string]*pendingTerminalError{},
@@ -146,6 +149,11 @@ func (s *supervisor) Run() (int, error) {
 	}
 	if err := s.logger.Initialize(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 1, err
+	}
+	if codexVersion, err := installedCodexVersion(context.Background(), s.options); err != nil {
+		s.logger.Log("Could not detect Codex version: " + err.Error())
+	} else {
+		s.modifyState(func(state *supervisorState) { state.CodexVersion = codexVersion })
 	}
 	if err := s.persist(); err != nil {
 		return 1, err
@@ -188,9 +196,15 @@ func (s *supervisor) Run() (int, error) {
 	s.proxy = proxy
 	s.proxyServer = proxy
 	tuiInitialized := make(chan struct{}, 1)
-	proxy.OnServerMessage(func(message rpcMessage, _ string) { s.enqueue(false, message) })
-	proxy.OnClientMessage(func(message rpcMessage, _ string) {
-		s.enqueue(true, message)
+	proxy.OnServerMessage(func(message rpcMessage, connectionID string) { s.enqueue(false, connectionID, message) })
+	proxy.OnClientMessage(func(message rpcMessage, connectionID string) {
+		if !proxy.IsPrimary(connectionID) {
+			return
+		}
+		if message.Method == "initialize" {
+			s.recordPrimaryClient(proxy.PrimaryClientInfo())
+		}
+		s.enqueue(true, connectionID, message)
 		if message.Method == "initialized" {
 			select {
 			case tuiInitialized <- struct{}{}:
@@ -228,6 +242,18 @@ func (s *supervisor) Run() (int, error) {
 	s.usageRPC = rpc
 	s.mu.Unlock()
 	s.probe = newProviderProbe(rpc, providerProbeOptions{CWD: s.options.CWD, Timeout: s.options.ProbeTimeout, HealthURL: s.options.HealthURL, Model: s.options.ProbeModel})
+	queueClient := newJSONRPCClient(appURL, rpcTimeout)
+	if err := queueClient.Connect(context.Background()); err != nil {
+		s.logger.Log("Experimental queue API unavailable: " + err.Error())
+	} else if err := queueClient.InitializeWithOptions(context.Background(), "codexdog_queue", true); err != nil {
+		s.logger.Log("Experimental queue API unavailable: " + err.Error())
+		queueClient.Close()
+	} else {
+		s.mu.Lock()
+		s.queueClient = queueClient
+		s.queueRPC = queueClient
+		s.mu.Unlock()
+	}
 
 	control, err := startControlServerWithActions(s.stateSnapshot, s.executeRemoteCommand, func() { s.shutdown("stop requested") })
 	if err != nil {
@@ -364,9 +390,9 @@ func (s *supervisor) spawnTUI(proxyURL string) (<-chan error, error) {
 	return done, nil
 }
 
-func (s *supervisor) enqueue(client bool, message rpcMessage) {
+func (s *supervisor) enqueue(client bool, connectionID string, message rpcMessage) {
 	select {
-	case s.events <- supervisorEvent{client: client, message: message}:
+	case s.events <- supervisorEvent{client: client, connectionID: connectionID, message: message}:
 	case <-s.done:
 	}
 }
@@ -375,6 +401,9 @@ func (s *supervisor) eventLoop() {
 	for {
 		select {
 		case event := <-s.events:
+			if s.proxyServer != nil && event.connectionID != "" && !s.proxyServer.IsPrimary(event.connectionID) {
+				continue
+			}
 			if event.client {
 				s.handleClientMessage(event.message)
 			} else {
@@ -384,6 +413,17 @@ func (s *supervisor) eventLoop() {
 			return
 		}
 	}
+}
+
+func (s *supervisor) recordPrimaryClient(name, clientVersion string) {
+	if name == "" && clientVersion == "" {
+		return
+	}
+	s.modifyState(func(state *supervisorState) {
+		state.PrimaryClient = name
+		state.PrimaryClientVersion = clientVersion
+	})
+	_ = s.persist()
 }
 
 func (s *supervisor) handleClientMessage(message rpcMessage) {
@@ -465,6 +505,14 @@ func (s *supervisor) handleServerMessage(message rpcMessage) {
 	}
 	if message.Method == "hook/completed" {
 		s.handleHookCompleted(message.Params)
+	}
+	if message.Method == "thread/settings/updated" {
+		s.handleThreadSettingsUpdated(message.Params)
+		return
+	}
+	if message.Method == "thread/queue/changed" {
+		s.handleThreadQueueChanged(message.Params)
+		return
 	}
 	if message.Method == "thread/started" {
 		s.handleThreadStarted(message.Params)
@@ -553,9 +601,79 @@ func (s *supervisor) handleThreadStarted(params map[string]any) {
 		s.logger.Log("Observed agent-managed thread " + id + "; direct recovery is disabled")
 		return
 	}
-	s.modifyState(func(state *supervisorState) { setCurrentThread(state, id) })
+	s.modifyState(func(state *supervisorState) {
+		setCurrentThread(state, id)
+		updateThreadMetadata(state, threadObject)
+	})
 	_ = s.persist()
 	s.scheduleUsageRefresh(0)
+}
+
+func (s *supervisor) handleThreadSettingsUpdated(params map[string]any) {
+	threadID, settings, ok := readThreadSettings(params)
+	if !ok || !s.threadAcceptsDirectInput(threadID) {
+		return
+	}
+	s.mu.Lock()
+	if s.state.CurrentThreadID != "" && s.state.CurrentThreadID != threadID {
+		s.mu.Unlock()
+		return
+	}
+	setCurrentThread(&s.state, threadID)
+	applyThreadSettings(&s.state, settings)
+	s.mu.Unlock()
+	_ = s.persist()
+}
+
+func (s *supervisor) handleThreadQueueChanged(params map[string]any) {
+	threadID, _ := readString(params["threadId"])
+	s.mu.Lock()
+	if threadID == "" || threadID != s.state.CurrentThreadID {
+		s.mu.Unlock()
+		return
+	}
+	s.state.QueueUpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	s.mu.Unlock()
+	_ = s.persist()
+}
+
+func updateThreadMetadata(state *supervisorState, threadObject map[string]any) {
+	if sessionID, ok := readString(threadObject["sessionId"]); ok {
+		state.SessionID = sessionID
+	}
+	if projectID, ok := readString(threadObject["projectId"]); ok {
+		state.ProjectID = projectID
+	}
+	if cwd, ok := readString(threadObject["cwd"]); ok && cwd != "" {
+		state.EffectiveCWD = cwd
+	}
+	if settings, ok := asObject(threadObject["threadSettings"]); ok {
+		_, parsed, _ := readThreadSettings(map[string]any{"threadId": state.CurrentThreadID, "threadSettings": settings})
+		applyThreadSettings(state, parsed)
+	}
+}
+
+func applyThreadSettings(state *supervisorState, settings threadSettings) {
+	if settings.CWD != "" {
+		state.EffectiveCWD = settings.CWD
+	}
+	state.ActivePermissionProfile = settings.PermissionProfile
+	state.ActivePermissionProfileExtends = settings.PermissionProfileBase
+	if settings.ApprovalPolicy != "" {
+		state.ApprovalPolicy = settings.ApprovalPolicy
+	}
+	if settings.ApprovalsReviewer != "" {
+		state.ApprovalsReviewer = settings.ApprovalsReviewer
+	}
+	if settings.SandboxPolicy != "" {
+		state.SandboxPolicy = settings.SandboxPolicy
+	}
+	if settings.Model != "" {
+		state.Model = settings.Model
+	}
+	if settings.ModelProvider != "" {
+		state.ModelProvider = settings.ModelProvider
+	}
 }
 
 func threadDirectInputCapability(threadObject map[string]any) (bool, bool) {
@@ -1436,14 +1554,13 @@ func (s *supervisor) resumeStalledThread(stall stallContext, generation uint64) 
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": stall.ThreadID, "cwd": s.options.CWD}); err != nil {
+	if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": stall.ThreadID}); err != nil {
 		s.failStallRecovery(generation, err)
 		return
 	}
 	value, err := s.proxy.Request(ctx, "turn/start", map[string]any{
 		"threadId":            stall.ThreadID,
 		"input":               []any{map[string]any{"type": "text", "text": stallContinuationPrompt}},
-		"cwd":                 s.options.CWD,
 		"clientUserMessageId": fmt.Sprintf("codexdog:stall:%d:%s", count, stall.TurnID),
 	})
 	if err != nil {
@@ -1554,7 +1671,7 @@ func (s *supervisor) recoverCyberPolicy(recovery recoveryContext) {
 		if s.isManuallyPaused() {
 			return
 		}
-		if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": recovery.ThreadID, "cwd": s.options.CWD}); err != nil {
+		if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": recovery.ThreadID}); err != nil {
 			_ = s.setAttention("Cyber policy recovery failed: " + err.Error())
 			return
 		}
@@ -1565,7 +1682,6 @@ func (s *supervisor) recoverCyberPolicy(recovery recoveryContext) {
 	value, err := s.proxy.Request(ctx, "turn/start", map[string]any{
 		"threadId":            targetThreadID,
 		"input":               []any{map[string]any{"type": "text", "text": action.Prompt}},
-		"cwd":                 s.options.CWD,
 		"clientUserMessageId": fmt.Sprintf("codexdog:cyber-policy:%d:%s", attempts+1, recovery.FailedTurnID),
 	})
 	if err != nil {
@@ -1750,13 +1866,12 @@ func (s *supervisor) resumeThread(ctx context.Context, recovery recoveryContext)
 		s.notifyTelegram(fmt.Sprintf("Resumed the %s goal on thread %s.", goal.Status, recovery.ThreadID))
 		return nil
 	}
-	if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": recovery.ThreadID, "cwd": s.options.CWD}); err != nil {
+	if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": recovery.ThreadID}); err != nil {
 		return err
 	}
 	value, err := s.proxy.Request(ctx, "turn/start", map[string]any{
 		"threadId":            recovery.ThreadID,
 		"input":               []any{map[string]any{"type": "text", "text": continuationPrompt}},
-		"cwd":                 s.options.CWD,
 		"clientUserMessageId": "codexdog:" + recovery.FailedTurnID,
 	})
 	if err != nil {
@@ -1867,7 +1982,7 @@ func (s *supervisor) persist() error {
 		s.activityTimer = nil
 	}
 	s.state.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	state := s.state
+	state := copySupervisorState(s.state)
 	s.mu.Unlock()
 	return s.store.Write(state)
 }
@@ -1881,7 +1996,18 @@ func (s *supervisor) modifyState(update func(*supervisorState)) {
 func (s *supervisor) stateSnapshot() supervisorState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.state
+	return copySupervisorState(s.state)
+}
+
+func copySupervisorState(state supervisorState) supervisorState {
+	queueClientMessageIDs := state.QueueClientMessageIDs
+	if queueClientMessageIDs != nil {
+		state.QueueClientMessageIDs = make(map[string]string, len(queueClientMessageIDs))
+		for id, clientID := range queueClientMessageIDs {
+			state.QueueClientMessageIDs[id] = clientID
+		}
+	}
+	return state
 }
 
 func (s *supervisor) isShuttingDown() bool {
@@ -1948,6 +2074,9 @@ func (s *supervisor) shutdown(reason string) {
 		app := s.appCmd
 		telegram := s.telegram
 		s.telegram = nil
+		queueClient := s.queueClient
+		s.queueClient = nil
+		s.queueRPC = nil
 		s.mu.Unlock()
 		close(s.done)
 		for _, waiter := range waiters {
@@ -1973,6 +2102,9 @@ func (s *supervisor) shutdown(reason string) {
 		}
 		if s.rpc != nil {
 			s.rpc.Close()
+		}
+		if queueClient != nil {
+			queueClient.Close()
 		}
 		if s.proxyServer != nil {
 			_ = s.proxyServer.Close()

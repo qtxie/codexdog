@@ -1,0 +1,63 @@
+name: Codex app-server compatibility
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-compatibility-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    name: Codex ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: ${{ matrix.allow_failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 0.149.1
+            allow_failure: false
+          - version: latest
+            allow_failure: true
+    env:
+      CODEX_HOME: ${{ github.workspace }}/.codex-ci
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install Codex
+        run: npm install --global "@openai/codex@${{ matrix.version }}"
+
+      - name: Show Codex version
+        run: codex --version
+
+      - name: Test
+        run: go test ./...
+
+      - name: Validate app-server schema
+        run: go run . schema-check
+
+      - name: Run protocol smoke test
+        run: go run . smoke

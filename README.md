@@ -13,7 +13,7 @@ troubleshooting.
 ## Requirements
 
 - Go 1.24 or newer to build
-- Codex CLI with `app-server` and `--remote` support (tested with 0.148.0)
+- Codex CLI with `app-server` and `--remote` support (tested with 0.149.1)
 - A working Codex login and provider configuration
 
 ## Build and install
@@ -53,11 +53,40 @@ codexdog status -C . --json
 codexdog stop -C .
 ```
 
-With Codex CLI 0.148.0, text and JSON status include the current thread's token
+With Codex CLI 0.149.1, text and JSON status include the current thread's token
 breakdown and estimated credit/USD usage, plus account credit balance and rate
 limit windows. Account-wide fields are shown only when the signed-in account and
 billing route provide them. Collection is best effort: a status RPC failure is
 reported as `usageLastError` and does not affect turn supervision or recovery.
+
+## Codex 0.149.1 session support
+
+Codexdog records the active thread directory, session and project IDs, permission
+profile, approval policy, sandbox policy, model, and model provider from
+app-server settings updates. The workspace selected by `-C` remains the stable
+state key; the active thread directory follows Codex `/cd` changes and is used
+for recovery continuations, so recovery does not silently return to the initial
+directory.
+
+The local app-server proxy pins the first connection, which is the Codex TUI
+started by Codexdog, as its primary control connection. Native auxiliary tools
+can share the session without becoming the recovery target:
+
+```powershell
+codexdog agents -C . -- --no-alt-screen
+```
+
+Experimental queued submissions require a live supervisor. They are explicit
+operations and do not change the immediate `/prompt` behavior:
+
+```powershell
+codexdog queue -C . list
+codexdog queue -C . add "review the current diff after the active turn"
+codexdog queue -C . update QUEUE_ID "run focused tests next"
+codexdog queue -C . reorder QUEUE_ID FIRST_ID SECOND_ID
+codexdog queue -C . delete QUEUE_ID
+codexdog queue -C . start QUEUE_ID
+```
 
 ## Telegram remote control
 
@@ -90,6 +119,7 @@ The available commands are:
 /goal pause
 /goal resume
 /goal set OBJECTIVE
+/queue [list|add TEXT|delete ID|update ID TEXT|reorder ID [ID...]|start [ID]]
 /stop confirm
 /help
 ```
@@ -172,14 +202,25 @@ When `--health-url` is omitted, recovery uses the ephemeral Codex canary directl
 
 ## Compatibility checks
 
-Run the unit tests, protocol smoke test, and optional provider canary after upgrading Codex:
+Run the unit tests, installed-schema check, and protocol smoke test after
+upgrading Codex:
 
 ```powershell
 go test ./...
+codexdog doctor
+codexdog schema-check
 codexdog smoke
-codexdog canary
+codexdog doctor --canary
 ```
 
-`smoke` initializes the installed app-server and proxy, then creates and reads an ephemeral thread without consuming a model turn. `canary` additionally sends one minimal request through the configured provider.
+`doctor` reports the installed Codex compatibility and a compact, redacted
+Codex diagnostic summary. `schema-check` regenerates stable and experimental
+app-server schemas from the installed CLI and checks the protocol surface used
+by Codexdog. `smoke` initializes the installed app-server and proxy, then
+creates and reads an ephemeral thread without consuming a model turn.
+`doctor --canary` explicitly opts into one minimal provider request.
 
-The protocol implementation targets the Codex CLI 0.148.0 app-server schema. Run `smoke` after upgrading Codex because app-server WebSocket transport is still experimental.
+The protocol implementation targets the Codex CLI 0.149.1 app-server schema.
+The compatibility workflow keeps 0.149.1 pinned and exercises `latest` as a
+non-blocking early-warning job. Run `smoke` after upgrading Codex because
+app-server WebSocket transport is still experimental.

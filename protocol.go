@@ -30,6 +30,20 @@ type threadGoal struct {
 	Status    string
 }
 
+// threadSettings is deliberately a narrow, forward-compatible view of the
+// app-server ThreadSettings payload. Codexdog records the effective settings
+// but never sends them back as recovery overrides.
+type threadSettings struct {
+	CWD                   string
+	PermissionProfile     string
+	PermissionProfileBase string
+	ApprovalPolicy        string
+	ApprovalsReviewer     string
+	SandboxPolicy         string
+	Model                 string
+	ModelProvider         string
+}
+
 func parseRPC(data []byte) (rpcMessage, bool) {
 	var message rpcMessage
 	if err := json.Unmarshal(data, &message); err != nil {
@@ -124,4 +138,54 @@ func decodeResult(raw json.RawMessage) (any, error) {
 func objectField(object map[string]any, name string) map[string]any {
 	value, _ := asObject(object[name])
 	return value
+}
+
+func readThreadSettings(params map[string]any) (string, threadSettings, bool) {
+	threadID, ok := readString(params["threadId"])
+	if !ok || threadID == "" {
+		return "", threadSettings{}, false
+	}
+	object, ok := asObject(params["threadSettings"])
+	if !ok {
+		return "", threadSettings{}, false
+	}
+	settings := threadSettings{
+		CWD:               stringSetting(object["cwd"]),
+		ApprovalPolicy:    stringSetting(object["approvalPolicy"]),
+		ApprovalsReviewer: stringSetting(object["approvalsReviewer"]),
+		SandboxPolicy:     policySetting(object["sandboxPolicy"]),
+		Model:             stringSetting(object["model"]),
+		ModelProvider:     stringSetting(object["modelProvider"]),
+	}
+	if profile, ok := asObject(object["activePermissionProfile"]); ok {
+		settings.PermissionProfile, _ = readString(profile["id"])
+		settings.PermissionProfileBase, _ = readString(profile["extends"])
+	}
+	return threadID, settings, true
+}
+
+func stringSetting(value any) string {
+	if text, ok := readString(value); ok {
+		return text
+	}
+	if value == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+func policySetting(value any) string {
+	if text, ok := readString(value); ok {
+		return text
+	}
+	if object, ok := asObject(value); ok {
+		if typeName, ok := readString(object["type"]); ok {
+			return typeName
+		}
+	}
+	return stringSetting(value)
 }
