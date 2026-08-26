@@ -16,7 +16,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 var defaultBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 60 * time.Second}
 
