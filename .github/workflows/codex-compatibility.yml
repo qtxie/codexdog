@@ -50,6 +50,9 @@ jobs:
       - name: Install Codex
         run: npm install --global "@openai/codex@${{ matrix.version }}"
 
+      - name: Initialize Codex home
+        run: mkdir -p "$CODEX_HOME"
+
       - name: Show Codex version
         run: codex --version
 

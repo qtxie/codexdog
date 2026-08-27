@@ -1,11 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -606,7 +606,8 @@ func runProtocolSmokeWithOutput(options supervisorOptions, canary, output bool) 
 	args = append(args, "--listen", url)
 	command := exec.Command(options.CodexPath, args...)
 	command.Dir = options.CWD
-	command.Stdout, command.Stderr = io.Discard, io.Discard
+	var appOutput bytes.Buffer
+	command.Stdout, command.Stderr = &appOutput, &appOutput
 	processes, err := newProcessTree()
 	if err != nil {
 		return 1, fmt.Errorf("initialize child process management: %w", err)
@@ -616,7 +617,13 @@ func runProtocolSmokeWithOutput(options supervisorOptions, canary, output bool) 
 		return 1, err
 	}
 	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
+	go func() {
+		err := command.Wait()
+		if detail := strings.TrimSpace(appOutput.String()); err != nil && detail != "" {
+			err = fmt.Errorf("%w: %s", err, detail)
+		}
+		done <- err
+	}()
 	if err := waitForReady(port, done); err != nil {
 		return 1, err
 	}
