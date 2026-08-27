@@ -41,6 +41,14 @@ type supervisorOptions struct {
 	TelegramPollTimeout   time.Duration
 	TelegramNotify        bool
 	TelegramStatePath     string
+	WeChatAllowedUsers    []string
+	WeChatPollTimeout     time.Duration
+	WeChatLoginTimeout    time.Duration
+	WeChatOpenBrowser     bool
+	WeChatNotify          bool
+	WeChatDisabled        bool
+	WeChatCredentialsPath string
+	WeChatQRCodePath      string
 }
 
 type recoveryContext struct {
@@ -113,6 +121,7 @@ type supervisor struct {
 	turnTerminalWaiters      map[string]chan string
 	remoteMu                 sync.Mutex
 	telegram                 *telegramController
+	wechat                   *wechatController
 
 	events       chan supervisorEvent
 	done         chan struct{}
@@ -276,6 +285,9 @@ func (s *supervisor) Run() (int, error) {
 	if err := s.startTelegram(); err != nil {
 		return s.startupFailure(fmt.Errorf("start Telegram control: %w", err))
 	}
+	if err := s.startWeChat(); err != nil {
+		return s.startupFailure(fmt.Errorf("start WeChat control: %w", err))
+	}
 	stopSignals := s.installSignalHandlers()
 	defer stopSignals()
 	err = <-tuiDone
@@ -314,12 +326,45 @@ func (s *supervisor) startTelegram() error {
 	return nil
 }
 
-func (s *supervisor) notifyTelegram(message string) {
+func (s *supervisor) startWeChat() error {
+	if s.options.WeChatDisabled {
+		return nil
+	}
+	if _, err := os.Stat(s.options.WeChatCredentialsPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	controller, err := newWeChatController(s.options, s.executeRemoteCommand, s.logger, s.recordWeChatState)
+	if err != nil {
+		return err
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		return err
+	}
 	s.mu.Lock()
-	controller := s.telegram
+	s.wechat = controller
+	s.state.WeChatEnabled = true
 	s.mu.Unlock()
-	if controller != nil {
-		controller.Notify(message)
+	_ = s.persist()
+	s.logger.Log("WeChat iLink remote control enabled")
+	if len(s.options.WeChatAllowedUsers) == 0 {
+		s.logger.Log("WeChat controller is in discovery-only mode; send /uid, then configure an allowed user ID")
+	}
+	controller.Notify("Codexdog remote control is online.\n" + formatRemoteStatus(s.stateSnapshot()))
+	return nil
+}
+
+func (s *supervisor) notifyRemoteControls(message string) {
+	s.mu.Lock()
+	telegram := s.telegram
+	wechat := s.wechat
+	s.mu.Unlock()
+	if telegram != nil {
+		telegram.Notify(message)
+	}
+	if wechat != nil {
+		wechat.Notify(message)
 	}
 }
 
@@ -330,6 +375,21 @@ func (s *supervisor) recordTelegramState(err error) {
 			state.TelegramLastError = ""
 		} else {
 			state.TelegramLastError = sanitizeText(err.Error())
+		}
+	})
+	_ = s.persist()
+}
+
+func (s *supervisor) recordWeChatState(err error) {
+	s.modifyState(func(state *supervisorState) {
+		state.WeChatLastUpdateAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if err == nil {
+			state.WeChatLastError = ""
+		} else {
+			state.WeChatLastError = sanitizeText(err.Error())
+			if errors.Is(err, errWeChatTokenExpired) {
+				state.WeChatEnabled = false
+			}
 		}
 	})
 	_ = s.persist()
@@ -892,7 +952,7 @@ func (s *supervisor) handleTurnStarted(params map[string]any) {
 		s.logger.Log("Turn " + parsed.ID + " started while manually paused; interrupting it")
 		s.requestPausedTurnInterrupt(threadID, parsed.ID)
 	} else if ok {
-		s.notifyTelegram(fmt.Sprintf("Turn %s started on thread %s.", parsed.ID, valueOrDash(threadID)))
+		s.notifyRemoteControls(fmt.Sprintf("Turn %s started on thread %s.", parsed.ID, valueOrDash(threadID)))
 	}
 }
 
@@ -942,7 +1002,7 @@ func (s *supervisor) interruptPausedTurn(threadID, turnID string) {
 	s.watchdog.CompleteTurn(turnID)
 	s.syncStallState()
 	_ = s.persist()
-	s.notifyTelegram("Turn " + turnID + " started while paused and was interrupted.")
+	s.notifyRemoteControls("Turn " + turnID + " started while paused and was interrupted.")
 }
 
 func (s *supervisor) recordStartedTurnFromRequest(threadID, turnID string) bool {
@@ -1032,7 +1092,7 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 		s.cancelRecovery()
 		_ = s.persist()
 		s.logger.Log("Turn " + parsed.ID + " completed")
-		s.notifyTelegram("Turn " + parsed.ID + " completed.")
+		s.notifyRemoteControls("Turn " + parsed.ID + " completed.")
 		return
 	}
 
@@ -1051,7 +1111,7 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 			})
 			_ = s.persist()
 			s.logger.Log("Turn " + parsed.ID + " was interrupted by a manual pause")
-			s.notifyTelegram("Turn " + parsed.ID + " is paused.")
+			s.notifyRemoteControls("Turn " + parsed.ID + " is paused.")
 			return
 		}
 		if pendingError != nil && pendingError.Interrupting {
@@ -1080,7 +1140,7 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 		s.mu.Unlock()
 		_ = s.persist()
 		s.logger.Log("Turn " + parsed.ID + " was interrupted; no recovery scheduled")
-		s.notifyTelegram("Turn " + parsed.ID + " was interrupted; no automatic recovery was scheduled.")
+		s.notifyRemoteControls("Turn " + parsed.ID + " was interrupted; no automatic recovery was scheduled.")
 		return
 	}
 
@@ -1110,7 +1170,7 @@ func (s *supervisor) handleTurnCompleted(params map[string]any) {
 		state.LastFailedTurnID = parsed.ID
 		state.LastError = sanitizeText(formatFailure(failure))
 	})
-	s.notifyTelegram("Turn " + parsed.ID + " failed: " + sanitizeText(formatFailure(failure)))
+	s.notifyRemoteControls("Turn " + parsed.ID + " failed: " + sanitizeText(formatFailure(failure)))
 	context := recoveryContext{ThreadID: threadID, FailedTurnID: parsed.ID, Failure: failure}
 	if failure.Code == "cyberPolicy" {
 		go s.recoverCyberPolicy(context)
@@ -1732,7 +1792,7 @@ func (s *supervisor) startRecovery(recovery recoveryContext) {
 	s.mu.Unlock()
 	_ = s.persist()
 	s.logger.Log("Provider recovery started after " + formatFailure(recovery.Failure))
-	s.notifyTelegram("Provider recovery started after: " + sanitizeText(formatFailure(recovery.Failure)))
+	s.notifyRemoteControls("Provider recovery started after: " + sanitizeText(formatFailure(recovery.Failure)))
 	go func() {
 		if err := s.runRecovery(ctx, recovery); err != nil && ctx.Err() == nil {
 			_ = s.setAttention("Recovery failed: " + err.Error())
@@ -1795,7 +1855,7 @@ func (s *supervisor) runRecovery(ctx context.Context, recovery recoveryContext) 
 			_ = s.persist()
 			s.logger.Log(fmt.Sprintf("Provider probe succeeded (%d/%d)", successes, s.options.ProbeSuccesses))
 			if successes >= s.options.ProbeSuccesses {
-				s.notifyTelegram("Provider health checks passed; resuming Codex.")
+				s.notifyRemoteControls("Provider health checks passed; resuming Codex.")
 				return s.resumeThread(ctx, recovery)
 			}
 		} else {
@@ -1863,7 +1923,7 @@ func (s *supervisor) resumeThread(ctx context.Context, recovery recoveryContext)
 		})
 		_ = s.persist()
 		s.logger.Log(fmt.Sprintf("Resumed %s goal on thread %s after failure %s", goal.Status, recovery.ThreadID, recovery.FailedTurnID))
-		s.notifyTelegram(fmt.Sprintf("Resumed the %s goal on thread %s.", goal.Status, recovery.ThreadID))
+		s.notifyRemoteControls(fmt.Sprintf("Resumed the %s goal on thread %s.", goal.Status, recovery.ThreadID))
 		return nil
 	}
 	if _, err := s.proxy.Request(ctx, "thread/resume", map[string]any{"threadId": recovery.ThreadID}); err != nil {
@@ -1886,7 +1946,7 @@ func (s *supervisor) resumeThread(ctx context.Context, recovery recoveryContext)
 		return nil
 	}
 	s.logger.Log(fmt.Sprintf("Resumed thread %s as turn %s after failure %s", recovery.ThreadID, started.ID, recovery.FailedTurnID))
-	s.notifyTelegram(fmt.Sprintf("Resumed thread %s as turn %s.", recovery.ThreadID, started.ID))
+	s.notifyRemoteControls(fmt.Sprintf("Resumed thread %s as turn %s.", recovery.ThreadID, started.ID))
 	return nil
 }
 
@@ -1941,7 +2001,7 @@ func (s *supervisor) setAttention(message string) error {
 	})
 	err := s.persist()
 	s.logger.Log(message)
-	s.notifyTelegram("Codexdog needs attention: " + sanitizeText(message))
+	s.notifyRemoteControls("Codexdog needs attention: " + sanitizeText(message))
 	return err
 }
 
@@ -2074,6 +2134,8 @@ func (s *supervisor) shutdown(reason string) {
 		app := s.appCmd
 		telegram := s.telegram
 		s.telegram = nil
+		wechat := s.wechat
+		s.wechat = nil
 		queueClient := s.queueClient
 		s.queueClient = nil
 		s.queueRPC = nil
@@ -2089,6 +2151,7 @@ func (s *supervisor) shutdown(reason string) {
 			state.StoppedReason = reason
 			state.ControlToken = ""
 			state.TelegramEnabled = false
+			state.WeChatEnabled = false
 			state.NextProbeAt = ""
 			state.TerminalErrorSuspectedAt = ""
 		})
@@ -2096,6 +2159,10 @@ func (s *supervisor) shutdown(reason string) {
 		if telegram != nil {
 			telegram.SendFinal("Codexdog is stopping: " + sanitizeText(reason))
 			telegram.Stop()
+		}
+		if wechat != nil {
+			wechat.SendFinal("Codexdog is stopping: " + sanitizeText(reason))
+			wechat.Stop()
 		}
 		if s.probe != nil {
 			s.probe.Dispose()

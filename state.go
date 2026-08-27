@@ -53,6 +53,9 @@ type supervisorState struct {
 	TelegramEnabled                bool                      `json:"telegramEnabled,omitempty"`
 	TelegramLastError              string                    `json:"telegramLastError,omitempty"`
 	TelegramLastUpdateAt           string                    `json:"telegramLastUpdateAt,omitempty"`
+	WeChatEnabled                  bool                      `json:"wechatEnabled,omitempty"`
+	WeChatLastError                string                    `json:"wechatLastError,omitempty"`
+	WeChatLastUpdateAt             string                    `json:"wechatLastUpdateAt,omitempty"`
 	TerminalErrorSuspectedAt       string                    `json:"terminalErrorSuspectedAt,omitempty"`
 	TokenUsage                     *threadTokenUsageState    `json:"tokenUsage,omitempty"`
 	UsageEstimate                  *threadUsageEstimateState `json:"usageEstimate,omitempty"`

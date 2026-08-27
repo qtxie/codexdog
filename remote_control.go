@@ -83,6 +83,7 @@ func formatRemoteStatus(state supervisorState) string {
 		"Turn: " + valueOrDash(state.ActiveTurnID),
 		"Manual pause: " + yesNo(state.ManualPaused),
 		"Telegram control: " + yesNo(state.TelegramEnabled),
+		"WeChat control: " + yesNo(state.WeChatEnabled),
 		fmt.Sprintf("Automatic resumes: %d", state.AutomaticResumeCount),
 		fmt.Sprintf("Stall resumes: %d", state.StallRecoveryCount),
 		fmt.Sprintf("Provider probe: attempt %d, consecutive successes %d", state.ProbeAttempt, state.ConsecutiveProbeSuccesses),
@@ -93,6 +94,9 @@ func formatRemoteStatus(state supervisorState) string {
 	}
 	if state.TelegramLastError != "" {
 		lines = append(lines, "Telegram last error: "+state.TelegramLastError)
+	}
+	if state.WeChatLastError != "" {
+		lines = append(lines, "WeChat last error: "+state.WeChatLastError)
 	}
 	lines = append(lines, usageStatusLines(state)...)
 	return strings.Join(lines, "\n")
@@ -139,7 +143,7 @@ func (s *supervisor) remotePrompt(ctx context.Context, text string) (string, err
 			state.Phase = "running"
 		})
 		_ = s.persist()
-		s.notifyTelegram(fmt.Sprintf("Remote prompt steered turn %s.", turnID))
+		s.notifyRemoteControls(fmt.Sprintf("Remote prompt steered turn %s.", turnID))
 		_ = value
 		return "Prompt sent to the active turn.", nil
 	}
@@ -160,7 +164,7 @@ func (s *supervisor) remotePrompt(ctx context.Context, text string) (string, err
 		_ = s.persist()
 		return "", err
 	}
-	s.notifyTelegram("Remote prompt started a new turn.")
+	s.notifyRemoteControls("Remote prompt started a new turn.")
 	return "Prompt sent; Codex started a new turn.", nil
 }
 
@@ -205,7 +209,7 @@ func (s *supervisor) remotePause(ctx context.Context) (string, error) {
 	s.watchdog.CancelRecovery()
 	_ = s.persist()
 	if turnID == "" {
-		s.notifyTelegram("Manual pause enabled.")
+		s.notifyRemoteControls("Manual pause enabled.")
 		return "Paused automatic recovery and future turns.", nil
 	}
 	if proxy == nil {
@@ -219,7 +223,7 @@ func (s *supervisor) remotePause(ctx context.Context) (string, error) {
 			state.LastError = sanitizeText("manual pause interrupt failed: " + err.Error())
 		})
 		_ = s.persist()
-		s.notifyTelegram("Manual pause is enabled, but interrupt failed: " + sanitizeText(err.Error()))
+		s.notifyRemoteControls("Manual pause is enabled, but interrupt failed: " + sanitizeText(err.Error()))
 		return "Manual pause enabled, but interrupt failed: " + err.Error(), nil
 	}
 	s.modifyState(func(state *supervisorState) {
@@ -236,7 +240,7 @@ func (s *supervisor) remotePause(ctx context.Context) (string, error) {
 	s.watchdog.CompleteTurn(turnID)
 	s.syncStallState()
 	_ = s.persist()
-	s.notifyTelegram("Manual pause enabled; the active turn was interrupted.")
+	s.notifyRemoteControls("Manual pause enabled; the active turn was interrupted.")
 	return "Paused; active turn interrupt requested.", nil
 }
 
@@ -286,7 +290,7 @@ func (s *supervisor) remoteResume(ctx context.Context) (string, error) {
 		_ = s.persist()
 		return "", err
 	}
-	s.notifyTelegram("Manual resume requested.")
+	s.notifyRemoteControls("Manual resume requested.")
 	return "Resume requested.", nil
 }
 
@@ -330,7 +334,7 @@ func (s *supervisor) remoteGoal(ctx context.Context, args string) (string, error
 			return "", fmt.Errorf("set goal status: %w", err)
 		}
 		_ = value
-		s.notifyTelegram("Goal status set to " + status + ".")
+		s.notifyRemoteControls("Goal status set to " + status + ".")
 		return "Goal status set to " + status + ".", nil
 	case "set":
 		objective := strings.TrimSpace(strings.TrimPrefix(args, parts[0]))
@@ -346,7 +350,7 @@ func (s *supervisor) remoteGoal(ctx context.Context, args string) (string, error
 			return "", fmt.Errorf("set goal: %w", err)
 		}
 		_ = value
-		s.notifyTelegram("Goal objective updated.")
+		s.notifyRemoteControls("Goal objective updated.")
 		return "Goal objective updated and activated.", nil
 	default:
 		return "Usage: /goal, /goal pause, /goal resume, or /goal set OBJECTIVE", nil

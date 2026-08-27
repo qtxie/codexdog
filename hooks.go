@@ -11,7 +11,7 @@ func (s *supervisor) handleHookCompleted(params map[string]any) {
 		return
 	}
 	s.logger.Log(strings.ReplaceAll(message, "\n", " | "))
-	s.notifyTelegram(message)
+	s.notifyRemoteControls(message)
 }
 
 func hookFailureMessage(params map[string]any) (string, bool) {

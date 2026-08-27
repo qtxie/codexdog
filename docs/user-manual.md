@@ -360,6 +360,76 @@ Remote prompts execute under the Codex sandbox and approval configuration of
 the running session. Treat every allowed chat and user as someone who can direct
 that session. Do not expose the bot token, state file, or control token.
 
+## WeChat iLink remote control
+
+WeChat control is implemented directly against Tencent's iLink Bot API in Go.
+It performs QR login, persists the bot credential and `getupdates` cursor,
+receives messages by outbound HTTPS long polling, and replies using each
+sender's latest `context_token`. It does not need Python, Node.js, a webhook, or
+an inbound port. The implementation follows the protocol behavior documented
+by the MIT licensed
+[WeChat-Bridge project](https://github.com/yuuouu/WeChat-Bridge).
+
+Login is scoped to the same workspace key as the supervisor:
+
+```text
+codexdog wechat login -C /path/to/project
+codexdog wechat status -C /path/to/project
+```
+
+`login` opens the QR URL returned by iLink in the default browser and also
+prints it, or writes a temporary `wechat-login-*.png` under the state directory
+when image data is returned. Browser-launch failure is non-fatal; use
+`--wechat-no-browser` to skip the attempt. It waits up to 480 seconds for scan
+confirmation and refreshes an expired QR code up to three times; any temporary
+PNG is removed when the command finishes. The confirmed bot credential is
+retained in a private `wechat-*.json` file.
+
+User IDs are strings assigned by iLink, not numeric Telegram IDs. To bootstrap
+the allowlist:
+
+1. Start Codexdog after logging in, without any `--wechat-user-id` setting.
+2. Send `/uid` to the WeChat bot. In this discovery-only mode, all other
+   commands are ignored.
+3. Stop Codexdog and configure exactly the returned ID.
+4. Start Codexdog again.
+
+PowerShell:
+
+```powershell
+$env:CODEXDOG_WECHAT_USER_IDS = "your-ilink-user-id"
+codexdog start -C D:\work\project
+```
+
+Bash:
+
+```bash
+export CODEXDOG_WECHAT_USER_IDS="your-ilink-user-id"
+codexdog start -C /work/project
+```
+
+`--wechat-user-id ID` is repeatable and can be used instead of the environment
+variable. Every configured ID can issue the remote commands listed in the
+Telegram section, including `/queue`; WeChat additionally accepts `/uid`.
+Unknown commands return the standard help without exposing a general Codex
+JSON-RPC or shell interface.
+
+The latest context token is persisted only for allowed users. Lifecycle
+notifications use that token and are skipped until an allowed user has sent a
+message. Use `--wechat-no-notify` to retain command replies but disable these
+notifications. `--wechat-disabled` temporarily prevents a logged-in bot from
+starting. To permanently remove the credential, stop the supervisor and run:
+
+```text
+codexdog wechat logout -C /path/to/project
+```
+
+iLink itself requires the user to message the bot first, normally limits
+proactive replies to a 24-hour session window, and may block further sends after
+several consecutive bot messages until the user replies. A rejected send is
+recorded in `wechatLastError`; Codexdog does not attempt to bypass these service
+limits.
+
 ## Command reference
 
 | Command | Purpose |
@@ -374,6 +444,7 @@ that session. Do not expose the bot token, state file, or control token.
 | `codexdog canary` | Run the smoke checks plus one provider model turn. |
 | `codexdog agents` | Open Codex's native agents dashboard against the supervised session. |
 | `codexdog queue ACTION ...` | Manage explicit experimental queued submissions on a live supervisor. |
+| `codexdog wechat login\|status\|logout` | Manage the workspace's iLink Bot login. |
 | `codexdog version` | Print the Codexdog version. |
 | `codexdog help` | Print CLI usage and option defaults. |
 
@@ -401,6 +472,12 @@ The main options are:
 | `--telegram-user-id ID` | Allow a sender; repeatable and optional. | None |
 | `--telegram-poll-timeout-sec N` | Telegram long-poll duration from 1 to 50 seconds. | `30` |
 | `--telegram-no-notify` | Disable unsolicited Telegram notifications. | Notifications enabled |
+| `--wechat-user-id ID` | Allow an iLink sender; repeatable. With none, only `/uid` works. | None |
+| `--wechat-poll-timeout-sec N` | iLink long-poll duration from 1 to 50 seconds. | `35` |
+| `--wechat-login-timeout-sec N` | QR login deadline in seconds. Expired QR codes are refreshed up to three times within this window. | `480` |
+| `--wechat-no-browser` | Do not open the QR login URL in the default browser. | Browser opens automatically |
+| `--wechat-no-notify` | Disable unsolicited WeChat notifications. | Notifications enabled |
+| `--wechat-disabled` | Do not start the persisted WeChat bot. | Off |
 | `--state-dir DIR` | Override the state and log directory. | Platform default |
 | `--json` | Emit machine-readable status output. | Off |
 
@@ -414,6 +491,7 @@ Environment variables:
 | `CODEXDOG_TELEGRAM_TOKEN_FILE` | Path to the Telegram bot token file. |
 | `CODEXDOG_TELEGRAM_CHAT_IDS` | Comma-separated allowed chat IDs. |
 | `CODEXDOG_TELEGRAM_USER_IDS` | Comma-separated allowed user IDs. |
+| `CODEXDOG_WECHAT_USER_IDS` | Comma-separated allowed iLink user IDs. |
 
 ## State, logs, and shutdown
 
@@ -422,9 +500,11 @@ The default state directory is:
 - Windows: `%LOCALAPPDATA%\codex-supervisor`
 - Linux and macOS: `$HOME/.local/state/codex-supervisor`
 
-Each workspace gets a hashed `state-*.json`, `supervisor-*.log`, and Telegram
-offset file. State includes the loopback control port and a bearer token, so do
-not publish it. Logs are capped at 2 MiB with three rotations and redact common
+Each workspace gets a hashed `state-*.json`, `supervisor-*.log`, Telegram offset
+file, and, after iLink login, a `wechat-*.json` credential file. The state file
+includes the loopback control port and a bearer token; the WeChat file includes
+the iLink bot token and recent conversation context tokens. Do not publish
+either file. Logs are capped at 2 MiB with three rotations and redact common
 authorization, API-key, and token patterns. Review logs before sharing them
 because arbitrary provider messages may still contain sensitive context.
 
@@ -480,6 +560,16 @@ Verify the bot token, chat ID, optional user ID, and outbound HTTPS access to th
 Telegram API. The chat allowlist must match `message.chat.id`; the optional user
 allowlist must match `message.from.id`. Inspect `telegramLastError` in JSON status
 and the workspace supervisor log.
+
+### WeChat does not reply
+
+Run `codexdog wechat status -C WORKSPACE`, confirm that normal Codexdog status
+shows `WeChat control: yes`, and inspect `wechatLastError` in JSON status. With
+no allowlist, only `/uid` is accepted. With an allowlist, the sender must exactly
+match one of the configured iLink IDs. If the error contains `ret=-2`, send a
+new message from that WeChat user to reopen the iLink session window. Use
+`codexdog wechat logout` followed by `login` when the persisted bot credential
+has expired.
 
 ### Usage, cost, or rate limits are missing
 

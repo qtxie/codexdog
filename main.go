@@ -16,7 +16,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 var defaultBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 60 * time.Second}
 
@@ -96,6 +96,13 @@ func run(argv []string) (int, error) {
 			fmt.Printf("Terminal error suspected: %s\n", valueOrDash(state.TerminalErrorSuspectedAt))
 			fmt.Printf("Manual pause: %s\n", yesNo(state.ManualPaused))
 			fmt.Printf("Telegram control: %s\n", yesNo(state.TelegramEnabled))
+			fmt.Printf("WeChat control: %s\n", yesNo(state.WeChatEnabled))
+			if state.TelegramLastError != "" {
+				fmt.Printf("Telegram last error: %s\n", state.TelegramLastError)
+			}
+			if state.WeChatLastError != "" {
+				fmt.Printf("WeChat last error: %s\n", state.WeChatLastError)
+			}
 			fmt.Printf("Queue updated: %s\n", valueOrDash(state.QueueUpdatedAt))
 			fmt.Printf("Last error: %s\n", valueOrDash(state.LastError))
 			for _, line := range usageStatusLines(state) {
@@ -114,6 +121,8 @@ func run(argv []string) (int, error) {
 		}
 		fmt.Printf("Stop requested for %s\n", args.Options.CWD)
 		return 0, nil
+	case "wechat":
+		return runWeChatManagement(args, store)
 	case "smoke", "canary":
 		return runProtocolSmoke(args.Options, args.Command == "canary")
 	case "doctor":
@@ -145,7 +154,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	index := 0
 	if len(argv) > 0 {
 		switch argv[0] {
-		case "start", "status", "stop", "smoke", "canary", "doctor", "schema-check", "agents", "queue":
+		case "start", "status", "stop", "smoke", "canary", "doctor", "schema-check", "agents", "queue", "wechat":
 			command = argv[0]
 			index = 1
 		case "help", "--help", "-h":
@@ -174,6 +183,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		ProbeSuccesses: 2, Backoff: append([]time.Duration(nil), defaultBackoff...), MaxAutoResumes: 5,
 		StallConfirm: 30 * time.Second, StallInterruptTimeout: 15 * time.Second, MaxStallResumes: 2,
 		TelegramPollTimeout: telegramDefaultPollTimeout, TelegramNotify: true,
+		WeChatPollTimeout: 35 * time.Second, WeChatLoginTimeout: wechatDefaultLoginTimeout, WeChatOpenBrowser: true, WeChatNotify: true,
 	}
 	if token := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_BOT_TOKEN")); token != "" {
 		options.TelegramToken = token
@@ -192,6 +202,13 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		}
 		options.TelegramAllowedUsers = append(options.TelegramAllowedUsers, parsed...)
 	}
+	if value := strings.TrimSpace(os.Getenv("CODEXDOG_WECHAT_USER_IDS")); value != "" {
+		parsed, err := parseStringList(value, "CODEXDOG_WECHAT_USER_IDS")
+		if err != nil {
+			return parsedArguments{}, err
+		}
+		options.WeChatAllowedUsers = append(options.WeChatAllowedUsers, parsed...)
+	}
 	telegramTokenFile := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_TOKEN_FILE"))
 	jsonOutput := false
 	commandArgs := []string{}
@@ -206,7 +223,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	for ; index < len(argv); index++ {
 		arg := argv[index]
 		if arg == "--" {
-			if command == "queue" {
+			if command == "queue" || command == "wechat" {
 				commandArgs = append(commandArgs, argv[index+1:]...)
 			} else {
 				options.TUIArgs = append([]string(nil), argv[index+1:]...)
@@ -378,6 +395,45 @@ func parseArguments(argv []string) (parsedArguments, error) {
 			options.TelegramPollTimeout = time.Duration(parsed) * time.Second
 		case "--telegram-no-notify":
 			options.TelegramNotify = false
+		case "--wechat-user-id":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			value = strings.TrimSpace(value)
+			if value == "" {
+				return parsedArguments{}, fmt.Errorf("%s requires a non-empty iLink user ID", arg)
+			}
+			options.WeChatAllowedUsers = append(options.WeChatAllowedUsers, value)
+		case "--wechat-poll-timeout-sec":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			parsed, err := positiveInteger(value, arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			if parsed > 50 {
+				return parsedArguments{}, fmt.Errorf("%s must be between 1 and 50", arg)
+			}
+			options.WeChatPollTimeout = time.Duration(parsed) * time.Second
+		case "--wechat-login-timeout-sec":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			parsed, err := positiveInteger(value, arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.WeChatLoginTimeout = time.Duration(parsed) * time.Second
+		case "--wechat-no-browser":
+			options.WeChatOpenBrowser = false
+		case "--wechat-no-notify":
+			options.WeChatNotify = false
+		case "--wechat-disabled":
+			options.WeChatDisabled = true
 		case "--backoff-ms":
 			value, err := valueAfter(arg)
 			if err != nil {
@@ -407,7 +463,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		case "-h", "--help":
 			command = "help"
 		default:
-			if command == "queue" {
+			if command == "queue" || command == "wechat" {
 				commandArgs = append(commandArgs, arg)
 				continue
 			}
@@ -439,7 +495,10 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	}
 	options.TelegramAllowedChats = uniqueInt64(options.TelegramAllowedChats)
 	options.TelegramAllowedUsers = uniqueInt64(options.TelegramAllowedUsers)
+	options.WeChatAllowedUsers = uniqueStrings(options.WeChatAllowedUsers)
 	options.TelegramStatePath = filepath.Join(absoluteRoot, "telegram-"+workspaceKey(options.CWD)+".json")
+	options.WeChatCredentialsPath = filepath.Join(absoluteRoot, "wechat-"+workspaceKey(options.CWD)+".json")
+	options.WeChatQRCodePath = filepath.Join(absoluteRoot, "wechat-login-"+workspaceKey(options.CWD)+".png")
 	return parsedArguments{Command: command, CommandArgs: commandArgs, StateRoot: absoluteRoot, JSON: jsonOutput, DoctorCanary: doctorCanary, Options: options}, nil
 }
 
@@ -468,6 +527,36 @@ func uniqueInt64(values []int64) []int64 {
 	seen := make(map[int64]struct{}, len(values))
 	result := make([]int64, 0, len(values))
 	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func parseStringList(value, name string) ([]string, error) {
+	items := strings.Split(value, ",")
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			return nil, fmt.Errorf("%s contains an empty value", name)
+		}
+		result = append(result, item)
+	}
+	return result, nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
 		if _, ok := seen[value]; ok {
 			continue
 		}
@@ -524,6 +613,7 @@ Usage:
   codexdog schema-check [options]
   codexdog agents [options] [-- CODEX_AGENTS_ARGS...]
   codexdog queue ACTION [ARGS...] [options]
+  codexdog wechat [login|status|logout] [options]
 
 Options:
   -C, --cwd DIR               Workspace to open (default: current directory)
@@ -548,6 +638,12 @@ Options:
   --telegram-poll-timeout-sec N
                                Long-poll timeout from 1 to 50 seconds (default: 30)
   --telegram-no-notify         Disable unsolicited lifecycle notifications
+  --wechat-user-id ID          Allow a WeChat iLink user; repeatable
+  --wechat-poll-timeout-sec N  iLink long-poll timeout from 1 to 50 seconds (default: 35)
+  --wechat-login-timeout-sec N QR login timeout in seconds (default: 480)
+  --wechat-no-browser          Do not open the QR login URL in the default browser
+  --wechat-no-notify           Disable unsolicited WeChat lifecycle notifications
+  --wechat-disabled            Do not start the logged-in WeChat controller
   --state-dir DIR             State and log directory
   --json                      JSON output for status, doctor, schema-check, or queue
   --canary                    Run a provider-consuming canary as part of doctor

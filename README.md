@@ -7,7 +7,7 @@ It preserves the Codex process. Recovery is for a stopped task/turn, not for res
 Codexdog owns only the app-server and TUI processes it starts and closes them on exit, without scanning for or terminating independent Codex sessions. On Windows, both processes are placed in a kill-on-close Job Object, so their descendants are also terminated if codexdog is closed unexpectedly.
 
 See the [user manual](docs/user-manual.md) for installation on each supported
-platform, complete configuration, Telegram setup, operations, and
+platform, complete configuration, Telegram and WeChat setup, operations, and
 troubleshooting.
 
 ## Requirements
@@ -144,6 +144,47 @@ the Codex provider-recovery state.
 The local authenticated control server also accepts the same command layer at
 `POST /command` with a JSON body such as `{"name":"status"}`. It remains
 loopback-only and requires the bearer token in the state file.
+
+## WeChat iLink remote control
+
+Codexdog also includes a native Go client for Tencent's iLink Bot API. It uses
+QR login, credential and update-cursor persistence, outbound long polling,
+`context_token` replies, and typing-state updates. It does not require Python,
+Node.js, or an inbound port.
+
+Log in once for each workspace:
+
+```powershell
+codexdog wechat login -C .
+codexdog wechat status -C .
+```
+
+The login command opens the QR URL in the default browser and also prints it
+(or writes a temporary QR PNG when the service returns image data). It waits up
+to eight minutes for confirmation, refreshing an expired QR code automatically.
+Use `--wechat-no-browser` to skip browser launch. Use
+`--wechat-login-timeout-sec 900` to wait up to 15 minutes. Start Codexdog once
+without an allowlist and send `/uid` to the bot; discovery mode
+answers only that command. Then restart with the returned iLink user ID:
+
+```powershell
+$env:CODEXDOG_WECHAT_USER_IDS = "your-ilink-user-id"
+codexdog start -C .
+```
+
+The WeChat bot exposes the same `/status`, `/prompt`, `/pause`, `/resume`,
+`/goal`, `/queue`, `/stop confirm`, and `/help` controls as Telegram. Use
+`--wechat-user-id` as a repeatable alternative to the environment variable.
+Credentials, long-poll cursor, and the latest allowed-user context tokens are
+stored in a private per-workspace credential file. Use
+`codexdog wechat logout -C .` to remove them; stop the workspace supervisor
+first.
+
+iLink enforces its own session rules. A user must message the bot before it can
+reply, proactive sends can expire after roughly 24 hours, and WeChat may limit
+consecutive bot messages until the user replies. These service limits cannot be
+bypassed by Codexdog. The protocol implementation was informed by the MIT
+licensed [WeChat-Bridge project](https://github.com/yuuouu/WeChat-Bridge).
 
 State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervisor` on Windows and `$HOME/.local/state/codex-supervisor` elsewhere. Set `CODEXDOG_HOME`, `CODEX_SUPERVISOR_HOME`, or pass `--state-dir` to change this.
 
