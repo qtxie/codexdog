@@ -104,6 +104,10 @@ func run(argv []string) (int, error) {
 				fmt.Printf("WeChat last error: %s\n", state.WeChatLastError)
 			}
 			fmt.Printf("Queue updated: %s\n", valueOrDash(state.QueueUpdatedAt))
+			for _, line := range formatMCPStatus(state) {
+				fmt.Println(line)
+			}
+			fmt.Println(formatSubagentStatus(state))
 			fmt.Printf("Last error: %s\n", valueOrDash(state.LastError))
 			for _, line := range usageStatusLines(state) {
 				fmt.Println(line)

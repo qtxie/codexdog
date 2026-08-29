@@ -13,7 +13,7 @@ troubleshooting.
 ## Requirements
 
 - Go 1.24 or newer to build
-- Codex CLI with `app-server` and `--remote` support (tested with 0.149.1)
+- Codex CLI with `app-server` and `--remote` support (tested with 0.150.1)
 - A working Codex login and provider configuration
 
 ## Build and install
@@ -53,13 +53,13 @@ codexdog status -C . --json
 codexdog stop -C .
 ```
 
-With Codex CLI 0.149.1, text and JSON status include the current thread's token
+With Codex CLI 0.150.1, text and JSON status include the current thread's token
 breakdown and estimated credit/USD usage, plus account credit balance and rate
 limit windows. Account-wide fields are shown only when the signed-in account and
 billing route provide them. Collection is best effort: a status RPC failure is
 reported as `usageLastError` and does not affect turn supervision or recovery.
 
-## Codex 0.149.1 session support
+## Codex 0.150.1 session support
 
 Codexdog records the active thread directory, session and project IDs, permission
 profile, approval policy, sandbox policy, model, and model provider from
@@ -75,6 +75,18 @@ can share the session without becoming the recovery target:
 ```powershell
 codexdog agents -C . -- --no-alt-screen
 ```
+
+Codexdog also reports observed subagent status from Codex 0.150.1 and exposes
+the same view through authenticated remote control:
+
+```text
+/agents
+/recent [N]
+```
+
+`/recent` uses the 0.150.1 experimental timeline API and falls back to the
+bounded turns page, then stable thread history, when needed. MCP server runtime
+and authentication status are included in `status` output.
 
 Experimental queued submissions require a live supervisor. They are explicit
 operations and do not change the immediate `/prompt` behavior:
@@ -120,6 +132,8 @@ The available commands are:
 /goal resume
 /goal set OBJECTIVE
 /queue [list|add TEXT|delete ID|update ID TEXT|reorder ID [ID...]|start [ID]]
+/agents
+/recent [N]
 /stop confirm
 /help
 ```
@@ -261,7 +275,7 @@ by Codexdog. `smoke` initializes the installed app-server and proxy, then
 creates and reads an ephemeral thread without consuming a model turn.
 `doctor --canary` explicitly opts into one minimal provider request.
 
-The protocol implementation targets the Codex CLI 0.149.1 app-server schema.
-The compatibility workflow keeps 0.149.1 pinned and exercises `latest` as a
+The protocol implementation targets the Codex CLI 0.150.1 app-server schema.
+The compatibility workflow keeps 0.150.1 pinned and exercises `latest` as a
 non-blocking early-warning job. Run `smoke` after upgrading Codex because
 app-server WebSocket transport is still experimental.

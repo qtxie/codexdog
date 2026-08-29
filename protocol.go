@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 )
 
 type rpcMessage struct {
@@ -28,6 +29,25 @@ type turn struct {
 type threadGoal struct {
 	Objective string
 	Status    string
+}
+
+type mcpServerState struct {
+	Name          string `json:"name"`
+	RuntimeStatus string `json:"runtimeStatus,omitempty"`
+	AuthStatus    string `json:"authStatus,omitempty"`
+	PluginID      string `json:"pluginId,omitempty"`
+	ToolCount     int    `json:"toolCount,omitempty"`
+}
+
+type subagentState struct {
+	ThreadID        string `json:"threadId"`
+	ParentThreadID  string `json:"parentThreadId,omitempty"`
+	Status          string `json:"status,omitempty"`
+	Tool            string `json:"tool,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	Message         string `json:"message,omitempty"`
+	LastActivityAt  string `json:"lastActivityAt,omitempty"`
 }
 
 // threadSettings is deliberately a narrow, forward-compatible view of the
@@ -162,6 +182,49 @@ func readThreadSettings(params map[string]any) (string, threadSettings, bool) {
 		settings.PermissionProfileBase, _ = readString(profile["extends"])
 	}
 	return threadID, settings, true
+}
+
+func readMCPServerStates(value any) ([]mcpServerState, bool) {
+	object, ok := asObject(value)
+	if !ok {
+		return nil, false
+	}
+	values, ok := object["data"].([]any)
+	if !ok {
+		return nil, false
+	}
+	result := make([]mcpServerState, 0, len(values))
+	for _, value := range values {
+		server, ok := asObject(value)
+		if !ok {
+			continue
+		}
+		name, ok := readString(server["name"])
+		if !ok || strings.TrimSpace(name) == "" {
+			continue
+		}
+		state := mcpServerState{Name: name}
+		state.RuntimeStatus, _ = readString(server["runtimeStatus"])
+		state.AuthStatus, _ = readString(server["authStatus"])
+		state.PluginID, _ = readString(server["pluginId"])
+		if tools, ok := asObject(server["tools"]); ok {
+			state.ToolCount = len(tools)
+		}
+		result = append(result, state)
+	}
+	return result, true
+}
+
+func subagentStatusForThread(value any) string {
+	if status, ok := readString(value); ok {
+		return status
+	}
+	if object, ok := asObject(value); ok {
+		if typeName, ok := readString(object["type"]); ok {
+			return typeName
+		}
+	}
+	return ""
 }
 
 func stringSetting(value any) string {

@@ -13,8 +13,8 @@ func TestAssessCodexCompatibility(t *testing.T) {
 	}{
 		{version: "0.147.9", status: "fail"},
 		{version: "0.148.0", status: "warning"},
-		{version: "0.149.1", status: "pass"},
-		{version: "0.150.0", status: "warning"},
+		{version: "0.149.1", status: "warning"},
+		{version: "0.150.0", status: "pass"},
 	} {
 		if got := assessCodexCompatibility(test.version).Status; got != test.status {
 			t.Fatalf("compatibility(%s) = %s, want %s", test.version, got, test.status)

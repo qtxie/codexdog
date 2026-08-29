@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - version: 0.149.1
+          - version: 0.150.1
             allow_failure: false
           - version: latest
             allow_failure: true

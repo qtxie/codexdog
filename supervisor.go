@@ -79,6 +79,8 @@ type supervisorEvent struct {
 	message      rpcMessage
 }
 
+const interruptHookWaitTimeout = 10 * time.Minute
+
 type supervisor struct {
 	options  supervisorOptions
 	store    *stateStore
@@ -280,6 +282,7 @@ func (s *supervisor) Run() (int, error) {
 		return s.startupFailure(err)
 	}
 	s.scheduleUsageRefresh(0)
+	go s.refreshMCPStatus(context.Background())
 	s.startStallWatchdog()
 
 	if err := s.startTelegram(); err != nil {
@@ -555,10 +558,14 @@ func (s *supervisor) handleServerMessage(message rpcMessage) {
 	if message.Method == "" || message.Params == nil {
 		return
 	}
+	s.recordSubagentObservation(message)
 	s.recordAgentManagedCollabThreads(message.Params)
 	if message.Method == "account/rateLimits/updated" {
 		s.scheduleUsageRefresh(0)
 		return
+	}
+	if message.Method == "mcpServer/startupStatus/updated" {
+		go s.refreshMCPStatus(context.Background())
 	}
 	if message.Method == "thread/tokenUsage/updated" {
 		s.handleTokenUsageUpdated(message.Params)
@@ -618,7 +625,7 @@ func (s *supervisor) recordAgentManagedCollabThreads(params map[string]any) {
 		return
 	}
 	typeName, _ := readString(item["type"])
-	if typeName != "collabToolCall" {
+	if typeName != "collabToolCall" && typeName != "collabAgentToolCall" {
 		return
 	}
 	currentThreadID, _ := readString(params["threadId"])
@@ -630,6 +637,15 @@ func (s *supervisor) recordAgentManagedCollabThreads(params map[string]any) {
 	if receiverID, ok := readString(item["receiverThreadId"]); ok && receiverID != "" && receiverID != currentThreadID && senderThreadID == currentThreadID {
 		childIDs = append(childIDs, receiverID)
 	}
+	if receiverIDs, ok := item["receiverThreadIds"].([]any); ok {
+		for _, value := range receiverIDs {
+			receiverID, ok := readString(value)
+			if ok && receiverID != "" && receiverID != currentThreadID &&
+				(senderThreadID == "" || senderThreadID == currentThreadID) {
+				childIDs = append(childIDs, receiverID)
+			}
+		}
+	}
 	if len(childIDs) == 0 {
 		return
 	}
@@ -640,6 +656,161 @@ func (s *supervisor) recordAgentManagedCollabThreads(params map[string]any) {
 		}
 	}
 	s.mu.Unlock()
+}
+
+func (s *supervisor) recordSubagentObservation(message rpcMessage) {
+	if message.Params == nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	changed := false
+	s.mu.Lock()
+	defer func() {
+		s.mu.Unlock()
+		if changed {
+			_ = s.persist()
+		}
+	}()
+	upsert := func(threadID string) *subagentState {
+		if threadID == "" {
+			return nil
+		}
+		for index := range s.state.Subagents {
+			if s.state.Subagents[index].ThreadID == threadID {
+				return &s.state.Subagents[index]
+			}
+		}
+		s.state.Subagents = append(s.state.Subagents, subagentState{ThreadID: threadID})
+		changed = true
+		return &s.state.Subagents[len(s.state.Subagents)-1]
+	}
+	set := func(agent *subagentState, update func(*subagentState)) {
+		if agent == nil {
+			return
+		}
+		before := *agent
+		update(agent)
+		if *agent != before {
+			changed = true
+		}
+	}
+
+	if message.Method == "thread/started" {
+		if thread, ok := asObject(message.Params["thread"]); ok {
+			threadID, _ := readString(thread["id"])
+			accepts, known := threadDirectInputCapability(thread)
+			parentID, _ := readString(thread["parentThreadId"])
+			if (known && !accepts) || parentID != "" {
+				agent := upsert(threadID)
+				set(agent, func(value *subagentState) {
+					value.ParentThreadID = parentID
+					value.Status = "running"
+					if status := subagentStatusForThread(thread["status"]); status != "" {
+						value.Status = status
+					}
+					value.LastActivityAt = now
+				})
+			}
+		}
+	}
+
+	threadID, _ := readString(message.Params["threadId"])
+	if threadID != "" && !s.threadAcceptsDirectInputLocked(threadID) {
+		agent := upsert(threadID)
+		switch message.Method {
+		case "turn/started":
+			if _, ok := readTurn(message.Params["turn"]); ok {
+				set(agent, func(value *subagentState) { value.Status = "running"; value.Message = ""; value.LastActivityAt = now })
+			}
+		case "turn/completed":
+			if parsed, ok := readTurn(message.Params["turn"]); ok {
+				status := parsed.Status
+				if status == "failed" {
+					status = "errored"
+				}
+				set(agent, func(value *subagentState) { value.Status = status; value.LastActivityAt = now })
+			}
+		}
+	}
+
+	item, ok := asObject(message.Params["item"])
+	if !ok {
+		return
+	}
+	typeName, _ := readString(item["type"])
+	if typeName == "subAgentActivity" {
+		agentID, _ := readString(item["agentThreadId"])
+		agent := upsert(agentID)
+		set(agent, func(value *subagentState) {
+			if value.ParentThreadID == "" {
+				value.ParentThreadID = threadID
+			}
+			kind, _ := readString(item["kind"])
+			switch kind {
+			case "started", "interacted":
+				value.Status = "running"
+			case "interrupted":
+				value.Status = "interrupted"
+			case "completed":
+				value.Status = "completed"
+			}
+			value.LastActivityAt = now
+		})
+		return
+	}
+	if typeName != "collabToolCall" && typeName != "collabAgentToolCall" {
+		return
+	}
+	senderID, _ := readString(item["senderThreadId"])
+	if senderID == "" {
+		senderID = threadID
+	}
+	receivers := []string{}
+	if value, ok := item["receiverThreadId"].(string); ok && value != "" {
+		receivers = append(receivers, value)
+	}
+	if values, ok := item["receiverThreadIds"].([]any); ok {
+		for _, value := range values {
+			if receiverID, ok := readString(value); ok && receiverID != "" {
+				receivers = append(receivers, receiverID)
+			}
+		}
+	}
+	agentsStates, _ := item["agentsStates"].(map[string]any)
+	tool, _ := readString(item["tool"])
+	model, _ := readString(item["model"])
+	reasoning, _ := readString(item["reasoningEffort"])
+	callStatus, _ := readString(item["status"])
+	for _, receiverID := range receivers {
+		agent := upsert(receiverID)
+		set(agent, func(value *subagentState) {
+			if value.ParentThreadID == "" {
+				value.ParentThreadID = senderID
+			}
+			value.Tool, value.Model, value.ReasoningEffort = tool, model, reasoning
+			if callStatus == "interrupted" {
+				value.Status = "interrupted"
+			} else if callStatus == "completed" || callStatus == "failed" {
+				value.Status = callStatus
+			} else if value.Status == "" {
+				value.Status = "running"
+			}
+			if statusObject, exists := agentsStates[receiverID]; exists {
+				if status := subagentStatusForThread(statusObject); status != "" {
+					value.Status = status
+				}
+				if statusMap, ok := asObject(statusObject); ok {
+					value.Message, _ = readString(statusMap["message"])
+				}
+			}
+			value.LastActivityAt = now
+		})
+	}
+}
+
+func (s *supervisor) threadAcceptsDirectInputLocked(threadID string) bool {
+	accepts, known := s.threadDirectInput[threadID]
+	return !known || accepts
 }
 
 func (s *supervisor) handleThreadStarted(params map[string]any) {
@@ -1306,15 +1477,8 @@ func (s *supervisor) reconcilePendingTerminalError(turnID string, generation uin
 		s.failPendingTerminalError(turnID, 0, fmt.Errorf("turn interrupt failed: %w", err))
 		return
 	}
-	timer := time.NewTimer(s.options.StallInterruptTimeout)
-	defer timer.Stop()
-	select {
-	case status := <-waiter:
-		if status == "" {
-			return
-		}
-		// handleTurnCompleted owns recovery after a real terminal event.
-	case <-timer.C:
+	terminalStatus := s.waitForInterruptedTurn(recovery.ThreadID, turnID, waiter)
+	if terminalStatus == "" {
 		s.mu.Lock()
 		delete(s.turnTerminalWaiters, turnID)
 		s.mu.Unlock()
@@ -1568,14 +1732,8 @@ func (s *supervisor) confirmAndRecoverStall(stall stallContext, generation uint6
 		s.failStallRecovery(generation, err)
 		return
 	}
-	timer := time.NewTimer(s.options.StallInterruptTimeout)
-	var terminal string
-	select {
-	case terminal = <-waiter:
-		if !timer.Stop() {
-			<-timer.C
-		}
-	case <-timer.C:
+	terminal := s.waitForInterruptedTurn(stall.ThreadID, stall.TurnID, waiter)
+	if terminal == "" {
 		s.mu.Lock()
 		delete(s.turnTerminalWaiters, stall.TurnID)
 		s.mu.Unlock()
@@ -1591,6 +1749,37 @@ func (s *supervisor) confirmAndRecoverStall(stall stallContext, generation uint6
 		return
 	}
 	s.resumeStalledThread(stall, generation)
+}
+
+// waitForInterruptedTurn extends the normal interrupt deadline while Codex is
+// running a synchronous Interrupt hook. Without this, a valid slow hook can
+// be mistaken for a broken app-server turn and trigger duplicate recovery.
+func (s *supervisor) waitForInterruptedTurn(threadID, turnID string, waiter <-chan string) string {
+	base := s.options.StallInterruptTimeout
+	if base <= 0 {
+		base = 15 * time.Second
+	}
+	timer := time.NewTimer(base)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	extended := false
+	for {
+		select {
+		case status := <-waiter:
+			return status
+		case <-timer.C:
+			if !extended && s.watchdog.InterruptHookActive(threadID, turnID) {
+				extended = true
+				timer.Reset(interruptHookWaitTimeout)
+				continue
+			}
+			return ""
+		case <-ticker.C:
+			// A hook may start immediately after turn/interrupt returns. The
+			// timer path checks again at the deadline, so no extra state is needed.
+		}
+	}
 }
 
 func (s *supervisor) resumeStalledThread(stall stallContext, generation uint64) {
@@ -2066,6 +2255,12 @@ func copySupervisorState(state supervisorState) supervisorState {
 		for id, clientID := range queueClientMessageIDs {
 			state.QueueClientMessageIDs[id] = clientID
 		}
+	}
+	if state.MCPServers != nil {
+		state.MCPServers = append([]mcpServerState(nil), state.MCPServers...)
+	}
+	if state.Subagents != nil {
+		state.Subagents = append([]subagentState(nil), state.Subagents...)
 	}
 	return state
 }

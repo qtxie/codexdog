@@ -51,6 +51,7 @@ type activeTurnState struct {
 	WaitingFlags         map[string]bool
 	SafetyBuffering      bool
 	VerificationRequired bool
+	InterruptHooks       int
 	SuspectedAt          time.Time
 	Recovering           bool
 }
@@ -62,7 +63,7 @@ type stallWatchdog struct {
 }
 
 var blockingItemTypes = map[string]bool{
-	"collabToolCall": true, "commandExecution": true, "contextCompaction": true,
+	"collabToolCall": true, "collabAgentToolCall": true, "commandExecution": true, "contextCompaction": true,
 	"dynamicToolCall": true, "fileChange": true, "imageView": true,
 	"mcpToolCall": true, "webSearch": true,
 }
@@ -126,8 +127,14 @@ func (w *stallWatchdog) Observe(message rpcMessage, now time.Time) stallObservat
 		if !hookIsAsync(message.Params) {
 			a.BlockingItems[hookKey(message.Params)] = "hook"
 		}
+		if hookEventName(message.Params) == "interrupt" {
+			a.InterruptHooks++
+		}
 	case "hook/completed":
 		delete(a.BlockingItems, hookKey(message.Params))
+		if hookEventName(message.Params) == "interrupt" && a.InterruptHooks > 0 {
+			a.InterruptHooks--
+		}
 	}
 	recordActivity(a, now)
 	return stallObservation{Activity: true, SuspicionCleared: cleared}
@@ -214,6 +221,12 @@ func (w *stallWatchdog) Snapshot() stallSnapshot {
 	return stallSnapshot{ThreadID: w.active.ThreadID, TurnID: w.active.TurnID, LastActivityAt: w.active.LastActivityAt, SuspectedAt: w.active.SuspectedAt, PauseReason: pauseReason(w.active, w.options), Recovering: w.active.Recovering}
 }
 
+func (w *stallWatchdog) InterruptHookActive(threadID, turnID string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.active != nil && w.active.ThreadID == threadID && w.active.TurnID == turnID && w.active.InterruptHooks > 0
+}
+
 func matchesActiveTurn(params map[string]any, active *activeTurnState) bool {
 	threadID, hasThread := readString(params["threadId"])
 	turnID, hasTurn := readString(params["turnId"])
@@ -296,4 +309,12 @@ func hookIsAsync(params map[string]any) bool {
 		return mode == "async"
 	}
 	return false
+}
+
+func hookEventName(params map[string]any) string {
+	if run, ok := asObject(params["run"]); ok {
+		name, _ := readString(run["eventName"])
+		return name
+	}
+	return ""
 }

@@ -25,6 +25,8 @@ const remoteHelpText = `Commands:
 /goal - show the current goal
 /goal pause|resume - change the current goal status
 /goal set TEXT - replace the current goal objective
+/agents - show observed subagent status
+/recent [N] - show recent timeline entries (with a turns/history fallback)
 /queue - manage queued submissions for the current thread
 /stop confirm - stop codexdog and the Codex processes it owns
 /help - show this help`
@@ -43,6 +45,7 @@ func (s *supervisor) executeRemoteCommand(ctx context.Context, command remoteCom
 	case "status":
 		refreshCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		s.refreshUsageSnapshot(refreshCtx)
+		s.refreshMCPStatus(refreshCtx)
 		cancel()
 		return formatRemoteStatus(s.stateSnapshot()), nil
 	case "help":
@@ -55,6 +58,10 @@ func (s *supervisor) executeRemoteCommand(ctx context.Context, command remoteCom
 		return s.remoteResume(ctx)
 	case "goal":
 		return s.remoteGoal(ctx, strings.TrimSpace(command.Text))
+	case "agents":
+		return formatSubagentStatus(s.stateSnapshot()), nil
+	case "recent":
+		return s.remoteRecent(ctx, strings.TrimSpace(command.Text))
 	case "queue":
 		return s.remoteQueue(ctx, strings.TrimSpace(command.Text))
 	case "stop":
@@ -98,7 +105,34 @@ func formatRemoteStatus(state supervisorState) string {
 	if state.WeChatLastError != "" {
 		lines = append(lines, "WeChat last error: "+state.WeChatLastError)
 	}
+	lines = append(lines, formatMCPStatus(state)...)
+	lines = append(lines, formatSubagentStatus(state))
 	lines = append(lines, usageStatusLines(state)...)
+	return strings.Join(lines, "\n")
+}
+
+func formatSubagentStatus(state supervisorState) string {
+	if len(state.Subagents) == 0 {
+		return "Subagents: none observed"
+	}
+	lines := []string{"Subagents:"}
+	for _, agent := range state.Subagents {
+		line := "- " + valueOrDash(agent.ThreadID) + ": " + valueOrDash(agent.Status)
+		if agent.Tool != "" {
+			line += " via " + agent.Tool
+		}
+		if agent.Model != "" {
+			line += " (" + agent.Model
+			if agent.ReasoningEffort != "" {
+				line += ", " + agent.ReasoningEffort
+			}
+			line += ")"
+		}
+		if agent.Message != "" {
+			line += ": " + compactTimelineText(agent.Message)
+		}
+		lines = append(lines, line)
+	}
 	return strings.Join(lines, "\n")
 }
 

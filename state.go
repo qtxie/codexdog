@@ -66,6 +66,10 @@ type supervisorState struct {
 	UsageLastError                 string                    `json:"usageLastError,omitempty"`
 	QueueUpdatedAt                 string                    `json:"queueUpdatedAt,omitempty"`
 	QueueClientMessageIDs          map[string]string         `json:"queueClientMessageIds,omitempty"`
+	MCPServers                     []mcpServerState          `json:"mcpServers,omitempty"`
+	MCPUpdatedAt                   string                    `json:"mcpUpdatedAt,omitempty"`
+	MCPLastError                   string                    `json:"mcpLastError,omitempty"`
+	Subagents                      []subagentState           `json:"subagents,omitempty"`
 	UpdatedAt                      string                    `json:"updatedAt"`
 	StoppedReason                  string                    `json:"stoppedReason,omitempty"`
 }
