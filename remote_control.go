@@ -99,6 +99,9 @@ func formatRemoteStatus(state supervisorState) string {
 		"Last error: " + valueOrDash(state.LastError),
 		"Updated: " + valueOrDash(state.UpdatedAt),
 	}
+	if state.TelegramAlias != "" {
+		lines = append(lines, "Telegram alias: "+state.TelegramAlias)
+	}
 	if state.TelegramLastError != "" {
 		lines = append(lines, "Telegram last error: "+state.TelegramLastError)
 	}

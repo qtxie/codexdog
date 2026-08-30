@@ -16,7 +16,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 var defaultBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 60 * time.Second}
 
@@ -96,6 +96,7 @@ func run(argv []string) (int, error) {
 			fmt.Printf("Terminal error suspected: %s\n", valueOrDash(state.TerminalErrorSuspectedAt))
 			fmt.Printf("Manual pause: %s\n", yesNo(state.ManualPaused))
 			fmt.Printf("Telegram control: %s\n", yesNo(state.TelegramEnabled))
+			fmt.Printf("Telegram alias: %s\n", valueOrDash(state.TelegramAlias))
 			fmt.Printf("WeChat control: %s\n", yesNo(state.WeChatEnabled))
 			if state.TelegramLastError != "" {
 				fmt.Printf("Telegram last error: %s\n", state.TelegramLastError)
@@ -127,6 +128,8 @@ func run(argv []string) (int, error) {
 		return 0, nil
 	case "wechat":
 		return runWeChatManagement(args, store)
+	case "telegram":
+		return runTelegramManagement(args)
 	case "smoke", "canary":
 		return runProtocolSmoke(args.Options, args.Command == "canary")
 	case "doctor":
@@ -138,14 +141,34 @@ func run(argv []string) (int, error) {
 	case "queue":
 		return runQueueCommand(args, store)
 	case "start":
-		if err := validateTelegramOptions(args.Options); err != nil {
-			return 1, err
-		}
 		if state, ok := store.Read(); ok && queryControl(state) {
 			return 1, fmt.Errorf("a supervisor is already running for %s", args.Options.CWD)
 		}
 		if !stdinIsTerminal() {
 			return 1, errors.New("start requires an interactive terminal")
+		}
+		if args.Options.TelegramDisabled {
+			if args.Options.TelegramAlias != "" {
+				return 1, errors.New("--telegram-disabled cannot be combined with --telegram-alias")
+			}
+			clearTelegramOptions(&args.Options)
+		} else if args.Options.TelegramAlias != "" {
+			alias, err := normalizeTelegramAlias(args.Options.TelegramAlias)
+			if err != nil {
+				return 1, err
+			}
+			args.Options.TelegramAlias = alias
+			if err := ensureTelegramHub(args.Options, args.StateRoot, alias, args.Options.CWD); err != nil {
+				return 1, err
+			}
+			defer func() {
+				if err := unregisterTelegramHubSession(args.StateRoot, alias, args.Options.CWD); err != nil {
+					fmt.Fprintln(os.Stderr, "unregister Telegram session:", err)
+				}
+			}()
+			clearTelegramTransportOptions(&args.Options)
+		} else if err := validateTelegramOptions(args.Options); err != nil {
+			return 1, err
 		}
 		return newSupervisor(args.Options, store).Run()
 	default:
@@ -158,7 +181,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	index := 0
 	if len(argv) > 0 {
 		switch argv[0] {
-		case "start", "status", "stop", "smoke", "canary", "doctor", "schema-check", "agents", "queue", "wechat":
+		case "start", "status", "stop", "smoke", "canary", "doctor", "schema-check", "agents", "queue", "wechat", "telegram":
 			command = argv[0]
 			index = 1
 		case "help", "--help", "-h":
@@ -189,22 +212,26 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		TelegramPollTimeout: telegramDefaultPollTimeout, TelegramNotify: true,
 		WeChatPollTimeout: 35 * time.Second, WeChatLoginTimeout: wechatDefaultLoginTimeout, WeChatOpenBrowser: true, WeChatNotify: true,
 	}
-	if token := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_BOT_TOKEN")); token != "" {
-		options.TelegramToken = token
-	}
-	if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_CHAT_IDS")); value != "" {
-		parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_CHAT_IDS")
-		if err != nil {
-			return parsedArguments{}, err
+	telegramDisabledRequested := hasTelegramDisabledFlag(argv)
+	options.TelegramDisabled = telegramDisabledRequested
+	if !telegramDisabledRequested {
+		if token := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_BOT_TOKEN")); token != "" {
+			options.TelegramToken = token
 		}
-		options.TelegramAllowedChats = append(options.TelegramAllowedChats, parsed...)
-	}
-	if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_USER_IDS")); value != "" {
-		parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_USER_IDS")
-		if err != nil {
-			return parsedArguments{}, err
+		if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_CHAT_IDS")); value != "" {
+			parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_CHAT_IDS")
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.TelegramAllowedChats = append(options.TelegramAllowedChats, parsed...)
 		}
-		options.TelegramAllowedUsers = append(options.TelegramAllowedUsers, parsed...)
+		if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_USER_IDS")); value != "" {
+			parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_USER_IDS")
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.TelegramAllowedUsers = append(options.TelegramAllowedUsers, parsed...)
+		}
 	}
 	if value := strings.TrimSpace(os.Getenv("CODEXDOG_WECHAT_USER_IDS")); value != "" {
 		parsed, err := parseStringList(value, "CODEXDOG_WECHAT_USER_IDS")
@@ -213,7 +240,10 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		}
 		options.WeChatAllowedUsers = append(options.WeChatAllowedUsers, parsed...)
 	}
-	telegramTokenFile := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_TOKEN_FILE"))
+	telegramTokenFile := ""
+	if !telegramDisabledRequested {
+		telegramTokenFile = strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_TOKEN_FILE"))
+	}
 	jsonOutput := false
 	commandArgs := []string{}
 	doctorCanary := false
@@ -227,7 +257,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	for ; index < len(argv); index++ {
 		arg := argv[index]
 		if arg == "--" {
-			if command == "queue" || command == "wechat" {
+			if command == "queue" || command == "wechat" || command == "telegram" {
 				commandArgs = append(commandArgs, argv[index+1:]...)
 			} else {
 				options.TUIArgs = append([]string(nil), argv[index+1:]...)
@@ -399,6 +429,14 @@ func parseArguments(argv []string) (parsedArguments, error) {
 			options.TelegramPollTimeout = time.Duration(parsed) * time.Second
 		case "--telegram-no-notify":
 			options.TelegramNotify = false
+		case "--telegram-alias":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.TelegramAlias = value
+		case "--telegram-disabled":
+			options.TelegramDisabled = true
 		case "--wechat-user-id":
 			value, err := valueAfter(arg)
 			if err != nil {
@@ -467,7 +505,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		case "-h", "--help":
 			command = "help"
 		default:
-			if command == "queue" || command == "wechat" {
+			if command == "queue" || command == "wechat" || command == "telegram" {
 				commandArgs = append(commandArgs, arg)
 				continue
 			}
@@ -483,7 +521,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	if err != nil {
 		return parsedArguments{}, err
 	}
-	if telegramTokenFile != "" {
+	if telegramTokenFile != "" && !options.TelegramDisabled {
 		data, readErr := os.ReadFile(telegramTokenFile)
 		if readErr != nil {
 			return parsedArguments{}, fmt.Errorf("read Telegram token file: %w", readErr)
@@ -504,6 +542,29 @@ func parseArguments(argv []string) (parsedArguments, error) {
 	options.WeChatCredentialsPath = filepath.Join(absoluteRoot, "wechat-"+workspaceKey(options.CWD)+".json")
 	options.WeChatQRCodePath = filepath.Join(absoluteRoot, "wechat-login-"+workspaceKey(options.CWD)+".png")
 	return parsedArguments{Command: command, CommandArgs: commandArgs, StateRoot: absoluteRoot, JSON: jsonOutput, DoctorCanary: doctorCanary, Options: options}, nil
+}
+
+func hasTelegramDisabledFlag(argv []string) bool {
+	for index := 0; index < len(argv); index++ {
+		arg := argv[index]
+		if arg == "--" {
+			return false
+		}
+		if arg == "--telegram-disabled" {
+			return true
+		}
+		switch arg {
+		case "-C", "--cwd", "--codex", "--state-dir", "--health-url", "--probe-model",
+			"--probe-timeout-ms", "--probe-successes", "--error-grace-ms", "--max-auto-resumes",
+			"--stall-timeout-ms", "--stall-confirm-ms", "--stall-interrupt-timeout-ms",
+			"--max-stall-resumes", "--tool-stall-timeout-ms", "--telegram-token-file",
+			"--telegram-chat-id", "--telegram-user-id", "--telegram-poll-timeout-sec",
+			"--telegram-alias", "--wechat-user-id", "--wechat-poll-timeout-sec",
+			"--wechat-login-timeout-sec", "--backoff-ms", "-c", "--config":
+			index++
+		}
+	}
+	return false
 }
 
 func parseTelegramID(value, flag string) (int64, error) {
@@ -583,6 +644,19 @@ func validateTelegramOptions(options supervisorOptions) error {
 	return nil
 }
 
+func clearTelegramTransportOptions(options *supervisorOptions) {
+	options.TelegramToken = ""
+	options.TelegramAllowedChats = nil
+	options.TelegramAllowedUsers = nil
+	options.TelegramStatePath = ""
+}
+
+func clearTelegramOptions(options *supervisorOptions) {
+	clearTelegramTransportOptions(options)
+	options.TelegramAlias = ""
+	options.TelegramNotify = false
+}
+
 func positiveInteger(value, flag string) (int, error) {
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed <= 0 {
@@ -618,6 +692,7 @@ Usage:
   codexdog agents [options] [-- CODEX_AGENTS_ARGS...]
   codexdog queue ACTION [ARGS...] [options]
   codexdog wechat [login|status|logout] [options]
+  codexdog telegram [serve|status|stop|unregister ALIAS] [options]
 
 Options:
   -C, --cwd DIR               Workspace to open (default: current directory)
@@ -642,6 +717,8 @@ Options:
   --telegram-poll-timeout-sec N
                                Long-poll timeout from 1 to 50 seconds (default: 30)
   --telegram-no-notify         Disable unsolicited lifecycle notifications
+  --telegram-alias NAME        Register this session with the shared Telegram hub
+  --telegram-disabled          Ignore inherited Telegram configuration
   --wechat-user-id ID          Allow a WeChat iLink user; repeatable
   --wechat-poll-timeout-sec N  iLink long-poll timeout from 1 to 50 seconds (default: 35)
   --wechat-login-timeout-sec N QR login timeout in seconds (default: 480)
@@ -649,7 +726,7 @@ Options:
   --wechat-no-notify           Disable unsolicited WeChat lifecycle notifications
   --wechat-disabled            Do not start the logged-in WeChat controller
   --state-dir DIR             State and log directory
-  --json                      JSON output for status, doctor, schema-check, or queue
+  --json                      JSON output for status, doctor, schema-check, queue, or telegram
   --canary                    Run a provider-consuming canary as part of doctor
   -h, --help                  Show help
 
@@ -662,7 +739,7 @@ Examples:
   codexdog agents -C . -- --no-alt-screen
   codexdog queue add "review the current diff" -C .
   $env:CODEXDOG_TELEGRAM_BOT_TOKEN = "..."
-  codexdog start -C . --telegram-chat-id 123456789
+  codexdog start -C . --telegram-chat-id 123456789 --telegram-alias api
 `)
 }
 

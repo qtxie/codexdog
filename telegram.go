@@ -210,6 +210,36 @@ type telegramBotCommand struct {
 	Description string `json:"description"`
 }
 
+func telegramBotCommands(hub bool) []telegramBotCommand {
+	commands := []telegramBotCommand{{Command: "status", Description: "show Codexdog status"}}
+	if hub {
+		commands = append(commands,
+			telegramBotCommand{Command: "sessions", Description: "list Codex sessions"},
+			telegramBotCommand{Command: "use", Description: "select a Codex session"},
+			telegramBotCommand{Command: "at", Description: "run a command on one session"},
+		)
+	}
+	commands = append(commands,
+		telegramBotCommand{Command: "prompt", Description: "send a prompt"},
+		telegramBotCommand{Command: "pause", Description: "pause the current work"},
+		telegramBotCommand{Command: "resume", Description: "resume the current work"},
+		telegramBotCommand{Command: "goal", Description: "show or change the current goal"},
+		telegramBotCommand{Command: "queue", Description: "manage queued submissions"},
+		telegramBotCommand{Command: "agents", Description: "show observed subagents"},
+		telegramBotCommand{Command: "recent", Description: "show recent session activity"},
+	)
+	if hub {
+		commands = append(commands,
+			telegramBotCommand{Command: "watch", Description: "choose notification sessions"},
+			telegramBotCommand{Command: "unwatch", Description: "mute session notifications"},
+		)
+	}
+	return append(commands,
+		telegramBotCommand{Command: "stop", Description: "stop Codexdog (confirmation required)"},
+		telegramBotCommand{Command: "help", Description: "show available commands"},
+	)
+}
+
 func (c *telegramClient) GetMe(ctx context.Context) (telegramBot, error) {
 	var bot telegramBot
 	if err := c.do(ctx, "getMe", map[string]any{}, &bot); err != nil {
@@ -756,6 +786,13 @@ type telegramOutbound struct {
 	Text   string
 }
 
+type telegramActor struct {
+	ChatID int64
+	UserID int64
+}
+
+type telegramCommandDispatcher func(context.Context, telegramActor, telegramCommand, func(string)) error
+
 type telegramController struct {
 	client       telegramBotAPI
 	metadata     telegramMetadataAPI
@@ -763,6 +800,7 @@ type telegramController struct {
 	allowlist    telegramAllowlist
 	chatIDs      []int64
 	execute      func(context.Context, remoteCommand) (string, error)
+	dispatch     telegramCommandDispatcher
 	logger       *fileLogger
 	onStateError func(error)
 
@@ -867,15 +905,7 @@ func (c *telegramController) run(ctx context.Context) {
 			c.botUsername = strings.ToLower(strings.TrimSpace(bot.Username))
 			c.mu.Unlock()
 		}
-		commands := []telegramBotCommand{
-			{Command: "status", Description: "show Codexdog status"},
-			{Command: "prompt", Description: "send a prompt"},
-			{Command: "pause", Description: "pause the current work"},
-			{Command: "resume", Description: "resume the current work"},
-			{Command: "goal", Description: "show or change the current goal"},
-			{Command: "stop", Description: "stop Codexdog (confirmation required)"},
-			{Command: "help", Description: "show available commands"},
-		}
+		commands := telegramBotCommands(c.dispatch != nil)
 		if err := c.metadata.SetMyCommands(startupCtx, commands); err != nil && ctx.Err() == nil {
 			c.reportError(fmt.Errorf("set Telegram commands: %w", err))
 		}
@@ -998,21 +1028,20 @@ func (c *telegramController) handleUpdate(ctx context.Context, update telegramUp
 			return nil
 		}
 	}
-	remote := remoteCommand{Name: command.Name}
-	switch command.Name {
-	case "prompt":
-		remote.Text = command.Args
-	case "goal":
-		remote.Text = command.Args
-	case "stop":
-		remote.Text = command.Args
-		remote.Confirm = strings.EqualFold(strings.TrimSpace(command.Args), "confirm")
-	case "status", "pause", "resume", "help":
-		if command.Args != "" {
-			remote.Text = command.Args
+	actor := telegramActor{ChatID: message.Chat.ID}
+	if message.From != nil {
+		actor.UserID = message.From.ID
+	}
+	if c.dispatch != nil {
+		err := c.dispatch(ctx, actor, command, func(result string) { c.enqueueReply(message.Chat.ID, result) })
+		if err != nil {
+			c.enqueueReply(message.Chat.ID, "Error: "+sanitizeText(err.Error()))
 		}
-	default:
-		remote.Name = "help"
+		return nil
+	}
+	remote, ok := telegramCommandToRemote(command)
+	if !ok {
+		remote = remoteCommand{Name: "help"}
 	}
 	if c.execute == nil {
 		return errors.New("Telegram command executor is unavailable")
@@ -1026,6 +1055,19 @@ func (c *telegramController) handleUpdate(ctx context.Context, update telegramUp
 	}
 	c.enqueueReply(message.Chat.ID, result)
 	return nil
+}
+
+func telegramCommandToRemote(command telegramCommand) (remoteCommand, bool) {
+	remote := remoteCommand{Name: command.Name, Text: command.Args}
+	switch command.Name {
+	case "status", "prompt", "pause", "resume", "goal", "agents", "recent", "queue", "help":
+		return remote, true
+	case "stop":
+		remote.Confirm = strings.EqualFold(strings.TrimSpace(command.Args), "confirm")
+		return remote, true
+	default:
+		return remoteCommand{}, false
+	}
 }
 
 func (c *telegramController) enqueueReply(chatID int64, text string) {

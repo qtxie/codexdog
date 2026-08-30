@@ -304,14 +304,11 @@ pause the watchdog or hide a later stalled turn.
 
 ## Telegram remote control
 
-Telegram control uses outbound HTTPS long polling and does not open a public
-port. Create a bot, keep its token private, and determine the numeric chat ID
-that is allowed to control Codexdog. For a group, the chat ID is commonly a
-negative number. An optional user allowlist can further restrict who may issue
-commands inside an allowed group.
-
-The bot token is accepted through an environment variable or a private token
-file. A chat allowlist is mandatory whenever Telegram is enabled.
+Telegram control uses one detached, user-level hub to manage multiple Codexdog
+supervisors through a single bot. It uses outbound HTTPS long polling and each
+supervisor's authenticated loopback API; no public port is opened. A chat
+allowlist is mandatory. An optional user allowlist further restricts who may
+issue commands inside an allowed group.
 
 PowerShell example:
 
@@ -319,7 +316,8 @@ PowerShell example:
 $env:CODEXDOG_TELEGRAM_BOT_TOKEN = "123456:replace-me"
 $env:CODEXDOG_TELEGRAM_CHAT_IDS = "123456789,-1001234567890"
 $env:CODEXDOG_TELEGRAM_USER_IDS = "123456789"
-codexdog start -C D:\work\project
+codexdog start -C D:\work\api --telegram-alias api
+codexdog start -C D:\work\web --telegram-alias web
 ```
 
 Bash example using a token file:
@@ -330,37 +328,68 @@ install -m 0600 /path/to/bot-token ~/.config/codexdog-telegram-token
 codexdog start -C /work/project \
   --telegram-token-file ~/.config/codexdog-telegram-token \
   --telegram-chat-id 123456789 \
-  --telegram-user-id 123456789
+  --telegram-user-id 123456789 \
+  --telegram-alias project
 ```
+
+The first aliased start ensures the hub is running, then registers the
+workspace. Later aliased starts reuse it. The hub is not owned by the first
+supervisor, so that session may stop without affecting the bot or other
+sessions. Later starts may omit bot configuration while the hub remains live;
+if they provide it, it must match the hub's global configuration.
 
 Available bot commands:
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Show supervisor, thread, probe, usage/cost, credit, rate-limit, and error state. |
-| `/prompt TEXT` | Steer the active turn, or start a new turn on the current thread. |
-| `/pause` | Interrupt the active turn and suppress automatic recovery. |
-| `/resume` | Resume the current thread or reactivate its saved goal. |
-| `/goal` | Show the current saved goal. |
-| `/goal pause` | Pause the saved goal. |
-| `/goal resume` | Reactivate the saved goal without a synthetic prompt. |
-| `/goal set TEXT` | Replace the goal objective. |
-| `/queue ACTION ...` | List, add, update, delete, reorder, or explicitly start experimental queued submissions. |
-| `/agents` | Show observed Codex subagent status for the current session. |
-| `/recent [N]` | Show recent timeline entries, falling back to turns/history when needed. |
-| `/stop confirm` | Stop Codexdog and the Codex processes it owns. |
+| `/sessions` | List registered aliases, workspaces, and live phases. |
+| `/use ALIAS` | Select the target for this chat/user pair. |
+| `/at ALIAS COMMAND ...` | Run one command without changing the selection. |
+| `/status` | Show selected-session state, usage, limits, and errors. |
+| `/prompt TEXT` | Steer or start a turn in the selected session. |
+| `/pause` | Interrupt and manually pause the selected session. |
+| `/resume` | Resume the selected thread or saved goal. |
+| `/goal ...` | Inspect or update the selected session's goal. |
+| `/queue ACTION ...` | Manage the selected session's queued submissions. |
+| `/agents` | Show selected-session subagent status. |
+| `/recent [N]` | Show recent selected-session activity. |
+| `/watch [all\|ALIAS ...]` | Show or replace this chat's notification subscriptions. |
+| `/unwatch all\|ALIAS ...` | Mute notifications for all or named sessions. |
+| `/stop ALIAS confirm` | Stop an explicitly named supervisor. |
 | `/help` | Show the command list. |
 
-Lifecycle notifications, including failed or blocked hook alerts, are enabled
-by default. Use `--telegram-no-notify` to keep command replies but disable
-unsolicited notifications. Telegram update
-offsets are saved per workspace so old commands are not replayed after restart.
-A Telegram outage is recorded in status and logs but does not change provider
-recovery.
+Selections are independent per `(chat ID, user ID)`. Commands are FIFO within a
+session and concurrent across sessions. Notifications do not follow the current
+selection: they default to all sessions, are prefixed with `[ALIAS]`, and are
+filtered per chat using `/watch` and `/unwatch`. Command replies are never
+filtered. Use `--telegram-no-notify` on initial hub setup to disable unsolicited
+notifications globally.
+
+The hub persists one global Telegram offset, the alias registry, selections,
+subscriptions, and per-session event cursors. Supervisors keep a bounded recent
+event stream so a restarted hub can recover notifications emitted while it was
+offline. Telegram failure is recorded in hub status and logs but does not alter
+provider recovery.
+
+The hub normally needs no direct management. Diagnostic fallbacks are:
+
+```text
+codexdog telegram status
+codexdog telegram status --json
+codexdog telegram stop
+codexdog telegram serve
+codexdog telegram unregister ALIAS
+```
+
+Starting without `--telegram-alias` preserves embedded single-session mode. A
+bot token must never be polled by both modes at once. `--telegram-disabled`
+ignores inherited Telegram configuration for a supervisor that should have no
+Telegram control.
 
 Remote prompts execute under the Codex sandbox and approval configuration of
-the running session. Treat every allowed chat and user as someone who can direct
-that session. Do not expose the bot token, state file, or control token.
+the selected running session. Treat every allowed chat and user as someone who
+can direct every registered session. Do not expose the bot token, hub/supervisor
+state files, or control tokens.
 
 ## WeChat iLink remote control
 
@@ -411,10 +440,11 @@ codexdog start -C /work/project
 ```
 
 `--wechat-user-id ID` is repeatable and can be used instead of the environment
-variable. Every configured ID can issue the remote commands listed in the
-Telegram section, including `/queue`; WeChat additionally accepts `/uid`.
-Unknown commands return the standard help without exposing a general Codex
-JSON-RPC or shell interface.
+variable. Every configured ID can issue the per-supervisor `/status`, `/prompt`,
+`/pause`, `/resume`, `/goal`, `/queue`, `/agents`, `/recent`, `/stop confirm`, and
+`/help` commands; WeChat additionally accepts `/uid`. WeChat remains scoped to
+one workspace and does not use Telegram aliases. Unknown commands return the
+standard help without exposing a general Codex JSON-RPC or shell interface.
 
 The latest context token is persisted only for allowed users. Lifecycle
 notifications use that token and are skipped until an allowed user has sent a
@@ -447,6 +477,7 @@ limits.
 | `codexdog agents` | Open Codex's native agents dashboard against the supervised session. |
 | `codexdog queue ACTION ...` | Manage explicit experimental queued submissions on a live supervisor. |
 | `codexdog wechat login\|status\|logout` | Manage the workspace's iLink Bot login. |
+| `codexdog telegram serve\|status\|stop\|unregister` | Diagnose or manage the shared Telegram hub. |
 | `codexdog version` | Print the Codexdog version. |
 | `codexdog help` | Print CLI usage and option defaults. |
 
@@ -474,6 +505,8 @@ The main options are:
 | `--telegram-user-id ID` | Allow a sender; repeatable and optional. | None |
 | `--telegram-poll-timeout-sec N` | Telegram long-poll duration from 1 to 50 seconds. | `30` |
 | `--telegram-no-notify` | Disable unsolicited Telegram notifications. | Notifications enabled |
+| `--telegram-alias NAME` | Register this supervisor with the shared Telegram hub. | None |
+| `--telegram-disabled` | Ignore inherited Telegram configuration. | Off |
 | `--wechat-user-id ID` | Allow an iLink sender; repeatable. With none, only `/uid` works. | None |
 | `--wechat-poll-timeout-sec N` | iLink long-poll duration from 1 to 50 seconds. | `35` |
 | `--wechat-login-timeout-sec N` | QR login deadline in seconds. Expired QR codes are refreshed up to three times within this window. | `480` |
@@ -502,13 +535,16 @@ The default state directory is:
 - Windows: `%LOCALAPPDATA%\codex-supervisor`
 - Linux and macOS: `$HOME/.local/state/codex-supervisor`
 
-Each workspace gets a hashed `state-*.json`, `supervisor-*.log`, Telegram offset
-file, and, after iLink login, a `wechat-*.json` credential file. The state file
-includes the loopback control port and a bearer token; the WeChat file includes
-the iLink bot token and recent conversation context tokens. Do not publish
-either file. Logs are capped at 2 MiB with three rotations and redact common
-authorization, API-key, and token patterns. Review logs before sharing them
-because arbitrary provider messages may still contain sensitive context.
+Each workspace gets a hashed `state-*.json`, `supervisor-*.log`, legacy embedded
+Telegram offset file, and, after iLink login, a `wechat-*.json` credential file.
+Multi-session Telegram adds `telegram-hub.json`, `telegram-hub-offset.json`,
+`telegram-hub.lock`, and `telegram-hub.log` once per state directory. Hub state
+contains private loopback credentials, aliases, selections, subscriptions, and
+event cursors, but never the bot token. Supervisor state includes its alias and
+private loopback control credential. Do not publish these files. Logs are capped
+at 2 MiB with three rotations and redact common authorization, API-key, and
+token patterns. Review logs before sharing them because arbitrary provider
+messages may still contain sensitive context.
 
 On normal exit, Codexdog shuts down only the app-server and TUI process trees it
 started. It does not scan for or terminate unrelated Codex sessions. On Windows,
@@ -558,10 +594,18 @@ turn timeout.
 
 ### Telegram does not reply
 
-Verify the bot token, chat ID, optional user ID, and outbound HTTPS access to the
-Telegram API. The chat allowlist must match `message.chat.id`; the optional user
-allowlist must match `message.from.id`. Inspect `telegramLastError` in JSON status
-and the workspace supervisor log.
+Run `codexdog telegram status --json`. Confirm the hub is live and inspect
+`telegramLastError`; if startup failed, separately verify the configured bot
+token, network connectivity, and access to `api.telegram.org`. The chat allowlist must
+match `message.chat.id`; the optional user allowlist must match
+`message.from.id`. A `409` error means another process is polling the same bot
+token; stop the legacy embedded controller or other hub. Inspect
+`telegramLastError` and `telegram-hub.log`.
+
+If `/sessions` lists a session as offline, run `codexdog status -C WORKSPACE`.
+An alias left by an abruptly terminated supervisor can be reused for the same
+workspace or removed with `codexdog telegram unregister ALIAS`. A different
+alias cannot claim the same workspace until the stale registration is removed.
 
 ### WeChat does not reply
 

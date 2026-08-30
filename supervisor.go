@@ -41,6 +41,8 @@ type supervisorOptions struct {
 	TelegramPollTimeout   time.Duration
 	TelegramNotify        bool
 	TelegramStatePath     string
+	TelegramAlias         string
+	TelegramDisabled      bool
 	WeChatAllowedUsers    []string
 	WeChatPollTimeout     time.Duration
 	WeChatLoginTimeout    time.Duration
@@ -87,20 +89,21 @@ type supervisor struct {
 	logger   *fileLogger
 	watchdog *stallWatchdog
 
-	mu           sync.Mutex
-	state        supervisorState
-	appCmd       *exec.Cmd
-	tuiCmd       *exec.Cmd
-	proxy        proxyRequester
-	usageRPC     proxyRequester
-	queueRPC     proxyRequester
-	proxyServer  *tuiProxy
-	rpc          *jsonRPCClient
-	queueClient  *jsonRPCClient
-	probe        *providerProbe
-	control      *controlServer
-	processes    *processTree
-	shuttingDown bool
+	mu            sync.Mutex
+	state         supervisorState
+	appCmd        *exec.Cmd
+	tuiCmd        *exec.Cmd
+	proxy         proxyRequester
+	usageRPC      proxyRequester
+	queueRPC      proxyRequester
+	proxyServer   *tuiProxy
+	rpc           *jsonRPCClient
+	queueClient   *jsonRPCClient
+	probe         *providerProbe
+	control       *controlServer
+	notifications *notificationBroker
+	processes     *processTree
+	shuttingDown  bool
 
 	recoveryCancel       context.CancelFunc
 	recoveryGeneration   uint64
@@ -138,8 +141,9 @@ func newSupervisor(options supervisorOptions, store *stateStore) *supervisor {
 		options:                  options,
 		store:                    store,
 		logger:                   newLogger(store.LogPath),
+		notifications:            newNotificationBroker(),
 		watchdog:                 newStallWatchdog(stallWatchdogOptions{StallTimeout: options.StallTimeout, ConfirmTimeout: options.StallConfirm, ToolStallTimeout: options.ToolStallTimeout}),
-		state:                    supervisorState{Version: 2, PID: os.Getpid(), CWD: options.CWD, EffectiveCWD: options.CWD, Phase: "starting", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)},
+		state:                    supervisorState{Version: 2, PID: os.Getpid(), CWD: options.CWD, EffectiveCWD: options.CWD, Phase: "starting", TelegramAlias: options.TelegramAlias, TelegramEnabled: options.TelegramAlias != "", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)},
 		turnErrors:               map[string]turnError{},
 		turnHadRetryableError:    map[string]bool{},
 		pendingTerminalErrors:    map[string]*pendingTerminalError{},
@@ -266,7 +270,7 @@ func (s *supervisor) Run() (int, error) {
 		s.mu.Unlock()
 	}
 
-	control, err := startControlServerWithActions(s.stateSnapshot, s.executeRemoteCommand, func() { s.shutdown("stop requested") })
+	control, err := startControlServerWithActions(s.stateSnapshot, s.executeRemoteCommand, func() { s.shutdown("stop requested") }, s.notifications)
 	if err != nil {
 		return s.startupFailure(err)
 	}
@@ -359,6 +363,7 @@ func (s *supervisor) startWeChat() error {
 }
 
 func (s *supervisor) notifyRemoteControls(message string) {
+	s.notifications.Publish(message)
 	s.mu.Lock()
 	telegram := s.telegram
 	wechat := s.wechat
@@ -2341,6 +2346,7 @@ func (s *supervisor) shutdown(reason string) {
 		}
 		s.cancelRecovery()
 		s.logger.Log("Stopping supervisor: " + reason)
+		s.notifications.Publish("Codexdog is stopping: " + sanitizeText(reason))
 		s.modifyState(func(state *supervisorState) {
 			state.Phase = "stopped"
 			state.StoppedReason = reason

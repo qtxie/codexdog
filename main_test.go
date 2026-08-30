@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,6 +27,63 @@ func TestParseArgumentsTelegramConfiguration(t *testing.T) {
 	}
 	if args.Options.TelegramStatePath == "" {
 		t.Fatal("Telegram offset path was not derived")
+	}
+}
+
+func TestParseArgumentsTelegramHubConfiguration(t *testing.T) {
+	t.Setenv("CODEXDOG_TELEGRAM_BOT_TOKEN", "")
+	t.Setenv("CODEXDOG_TELEGRAM_CHAT_IDS", "")
+	args, err := parseArguments([]string{"start", "--telegram-alias", "API"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Options.TelegramAlias != "API" {
+		t.Fatalf("Telegram alias = %q", args.Options.TelegramAlias)
+	}
+	management, err := parseArguments([]string{"telegram", "status", "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if management.Command != "telegram" || fmt.Sprint(management.CommandArgs) != "[status]" || !management.JSON {
+		t.Fatalf("Telegram management args = %#v", management)
+	}
+}
+
+func TestTelegramDisabledIgnoresInheritedConfiguration(t *testing.T) {
+	t.Setenv("CODEXDOG_TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("CODEXDOG_TELEGRAM_CHAT_IDS", "not-an-id")
+	t.Setenv("CODEXDOG_TELEGRAM_TOKEN_FILE", filepath.Join(t.TempDir(), "missing"))
+	args, err := parseArguments([]string{"start", "--telegram-disabled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !args.Options.TelegramDisabled || args.Options.TelegramToken != "" || len(args.Options.TelegramAllowedChats) != 0 {
+		t.Fatalf("disabled Telegram options = %#v", args.Options)
+	}
+}
+
+func TestTelegramDisabledAfterSeparatorIsPassedToCodex(t *testing.T) {
+	t.Setenv("CODEXDOG_TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("CODEXDOG_TELEGRAM_CHAT_IDS", "not-an-id")
+	if _, err := parseArguments([]string{"start", "--", "--telegram-disabled"}); err == nil || !strings.Contains(err.Error(), "CODEXDOG_TELEGRAM_CHAT_IDS") {
+		t.Fatalf("Telegram configuration was unexpectedly disabled after --: %v", err)
+	}
+	t.Setenv("CODEXDOG_TELEGRAM_CHAT_IDS", "10")
+	args, err := parseArguments([]string{"start", "--", "--telegram-disabled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Options.TelegramDisabled || fmt.Sprint(args.Options.TUIArgs) != "[--telegram-disabled]" {
+		t.Fatalf("parsed args = %#v", args)
+	}
+}
+
+func TestTelegramDisabledPreScanSkipsOptionValues(t *testing.T) {
+	if hasTelegramDisabledFlag([]string{"start", "--telegram-token-file", "--telegram-disabled"}) {
+		t.Fatal("an option value was mistaken for --telegram-disabled")
+	}
+	if !hasTelegramDisabledFlag([]string{"start", "--telegram-token-file", "token.txt", "--telegram-disabled"}) {
+		t.Fatal("the real --telegram-disabled flag was not found")
 	}
 }
 

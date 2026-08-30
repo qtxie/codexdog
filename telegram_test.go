@@ -317,6 +317,80 @@ func TestTelegramControllerDispatchesOnlyAllowedCommands(t *testing.T) {
 	}
 }
 
+func TestTelegramControllerDispatchesActorAwareHubCommand(t *testing.T) {
+	api := &telegramControllerFakeAPI{sent: make(chan telegramOutbound, 2), updates: []telegramUpdate{{
+		UpdateID: 1,
+		Message:  &telegramMessage{Chat: telegramChat{ID: 10}, From: &telegramUser{ID: 20}, Text: "/use api"},
+	}}}
+	poller, err := newTelegramPoller(api, telegramPollerOptions{PollTimeout: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched := make(chan struct{}, 1)
+	controller := &telegramController{
+		client:    api,
+		poller:    poller,
+		allowlist: newTelegramAllowlist([]int64{10}, []int64{20}),
+		dispatch: func(_ context.Context, actor telegramActor, command telegramCommand, reply func(string)) error {
+			if actor.ChatID != 10 || actor.UserID != 20 || command.Name != "use" || command.Args != "api" {
+				t.Errorf("dispatch actor=%#v command=%#v", actor, command)
+			}
+			reply("[api] Selected for commands.")
+			dispatched <- struct{}{}
+			return nil
+		},
+		out: make(chan telegramOutbound, 4),
+	}
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Stop()
+	select {
+	case <-dispatched:
+	case <-time.After(time.Second):
+		t.Fatal("hub command was not dispatched")
+	}
+	select {
+	case sent := <-api.sent:
+		if sent.ChatID != 10 || sent.Text != "[api] Selected for commands." {
+			t.Fatalf("hub reply = %#v", sent)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hub reply was not sent")
+	}
+}
+
+func TestTelegramRemoteCommandIncludesQueueAgentsAndRecent(t *testing.T) {
+	for _, name := range []string{"queue", "agents", "recent"} {
+		remote, ok := telegramCommandToRemote(telegramCommand{Name: name, Args: "value"})
+		if !ok || remote.Name != name || remote.Text != "value" {
+			t.Fatalf("remote %s = %#v, %t", name, remote, ok)
+		}
+	}
+}
+
+func TestTelegramBotCommandsAdvertiseHubCommandsOnlyForHub(t *testing.T) {
+	commandNames := func(commands []telegramBotCommand) map[string]bool {
+		result := make(map[string]bool, len(commands))
+		for _, command := range commands {
+			result[command.Command] = true
+		}
+		return result
+	}
+	legacy := commandNames(telegramBotCommands(false))
+	hub := commandNames(telegramBotCommands(true))
+	for _, name := range []string{"sessions", "use", "at", "watch", "unwatch"} {
+		if legacy[name] || !hub[name] {
+			t.Fatalf("command %q legacy=%t hub=%t", name, legacy[name], hub[name])
+		}
+	}
+	for _, name := range []string{"status", "prompt", "queue", "stop", "help"} {
+		if !legacy[name] || !hub[name] {
+			t.Fatalf("shared command %q legacy=%t hub=%t", name, legacy[name], hub[name])
+		}
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

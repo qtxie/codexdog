@@ -102,27 +102,43 @@ codexdog queue -C . start QUEUE_ID
 
 ## Telegram remote control
 
-Codexdog can expose the same supervisor controls through a Telegram bot. The
-bot uses HTTPS long polling; it does not open an inbound port on the computer.
-Configure the token through an environment variable or a private file, and
-always configure an explicit chat allowlist:
+One Telegram bot can control any number of Codexdog supervisors. Give each
+workspace a stable alias when starting it:
 
 ```powershell
 $env:CODEXDOG_TELEGRAM_BOT_TOKEN = "123456:replace-me"
 $env:CODEXDOG_TELEGRAM_CHAT_IDS = "-1001234567890"
 $env:CODEXDOG_TELEGRAM_USER_IDS = "123456789" # optional additional restriction
-codexdog start -C .
+codexdog start -C D:\work\api --telegram-alias api
+```
+
+The first aliased start launches a detached, user-level Telegram hub and
+registers the workspace. Start other Codex sessions normally; they reuse the
+same hub and bot:
+
+```powershell
+codexdog start -C D:\work\web --telegram-alias web
+codexdog start -C D:\work\docs --telegram-alias docs
 ```
 
 For a token file, use `--telegram-token-file C:\secrets\codexdog-bot.txt` (or
 `CODEXDOG_TELEGRAM_TOKEN_FILE`). The file is read once at startup and the token
-is never written to supervisor state or logs. Repeat `--telegram-chat-id` and
-`--telegram-user-id` when more than one identity is allowed. A bot token without
-a chat allowlist is rejected at startup.
+is never written to hub or supervisor state or logs. A chat allowlist is always
+required. The first start supplies global bot settings. Later starts may omit
+them while the hub is running; if supplied, they must exactly match the live
+hub configuration.
+
+The hub is a separate process, not a child of any Codex session. Closing one
+session therefore leaves the bot and other sessions running. It uses one HTTPS
+long-poll stream and only calls each supervisor's authenticated loopback control
+API. It never exposes a public port or a general Codex JSON-RPC tunnel.
 
 The available commands are:
 
 ```text
+/sessions
+/use ALIAS
+/at ALIAS COMMAND [ARGS]
 /status
 /prompt TEXT
 /pause
@@ -134,30 +150,53 @@ The available commands are:
 /queue [list|add TEXT|delete ID|update ID TEXT|reorder ID [ID...]|start [ID]]
 /agents
 /recent [N]
-/stop confirm
+/watch [all|ALIAS ...]
+/unwatch all|ALIAS ...
+/stop ALIAS confirm
 /help
 ```
 
-`/prompt` steers an active turn with `turn/steer`; when the thread is idle it
-resumes the thread and starts a new text turn. `/pause` interrupts an active
-turn, cancels provider/stall recovery, and leaves future automatic recovery
-disabled until `/resume`. A saved Codex goal is resumed through
-`thread/goal/set` without injecting a synthetic prompt. `/stop` requires the
-literal confirmation word so an accidental message cannot terminate the
-supervisor.
+`/use` selects a session independently for each `(chat, user)` pair, so users in
+the same group do not change each other's target. `/at` runs one command on a
+named session without changing that selection. `/stop` always requires both an
+explicit alias and the literal confirmation word.
 
-Telegram update offsets are persisted per workspace under the configured state
-directory. This prevents already-processed commands from being replayed after
-a restart. Lifecycle notifications (turn failures, recovery, resumes, hook
-failures or blocks, and shutdown) are enabled by default; disable them with
-`--telegram-no-notify`.
-The poller retries transient Telegram/API transport failures and records the
-last Telegram error in `codexdog status --json`; Telegram outages do not change
-the Codex provider-recovery state.
+Lifecycle notifications from every session are tagged, for example
+`[api] Turn completed.` Selection affects commands only; notifications default
+to all registered sessions. `/watch` replaces a chat's subscriptions and
+`/unwatch` mutes named sessions. Replies to commands are always delivered even
+when notifications for that session are muted.
+
+Within each session, Telegram commands execute in arrival order. Different
+sessions have independent workers, so a slow command in `api` does not block a
+command for `web`. `/prompt`, `/pause`, `/resume`, goals, queues, and recovery
+retain their existing supervisor behavior.
+
+The global update offset, alias registry, selections, subscriptions, and event
+cursors are persisted privately under the configured state directory. A
+restarted hub reconnects to live supervisors and replays their bounded recent
+event buffers. Disable unsolicited notifications globally with
+`--telegram-no-notify` on the first aliased start.
+
+Administrative commands are available for diagnostics:
+
+```powershell
+codexdog telegram status
+codexdog telegram status --json
+codexdog telegram stop
+codexdog telegram serve # foreground fallback
+codexdog telegram unregister OLD_ALIAS
+```
+
+`codexdog start` without `--telegram-alias` retains the original embedded,
+single-session Telegram mode. Do not run that mode with the same token as the
+multi-session hub. Use `--telegram-disabled` when inherited Telegram environment
+variables should be ignored.
 
 The local authenticated control server also accepts the same command layer at
 `POST /command` with a JSON body such as `{"name":"status"}`. It remains
-loopback-only and requires the bearer token in the state file.
+loopback-only and requires the bearer token in the state file. Its `/events`
+endpoint supplies a bounded, cursor-based lifecycle stream to the hub.
 
 ## WeChat iLink remote control
 
@@ -186,9 +225,10 @@ $env:CODEXDOG_WECHAT_USER_IDS = "your-ilink-user-id"
 codexdog start -C .
 ```
 
-The WeChat bot exposes the same `/status`, `/prompt`, `/pause`, `/resume`,
-`/goal`, `/queue`, `/stop confirm`, and `/help` controls as Telegram. Use
-`--wechat-user-id` as a repeatable alternative to the environment variable.
+The WeChat bot exposes the per-supervisor `/status`, `/prompt`, `/pause`,
+`/resume`, `/goal`, `/queue`, `/stop confirm`, and `/help` controls. It remains
+workspace-scoped and does not use Telegram hub aliases. Use `--wechat-user-id`
+as a repeatable alternative to the environment variable.
 Credentials, long-poll cursor, and the latest allowed-user context tokens are
 stored in a private per-workspace credential file. Use
 `codexdog wechat logout -C .` to remove them; stop the workspace supervisor
@@ -200,7 +240,7 @@ consecutive bot messages until the user replies. These service limits cannot be
 bypassed by Codexdog. The protocol implementation was informed by the MIT
 licensed [WeChat-Bridge project](https://github.com/yuuouu/WeChat-Bridge).
 
-State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervisor` on Windows and `$HOME/.local/state/codex-supervisor` elsewhere. Set `CODEXDOG_HOME`, `CODEX_SUPERVISOR_HOME`, or pass `--state-dir` to change this.
+State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervisor` on Windows and `$HOME/.local/state/codex-supervisor` elsewhere. Multi-session Telegram hub state, its global update offset, lock, and log live in the same directory. Set `CODEXDOG_HOME`, `CODEX_SUPERVISOR_HOME`, or pass `--state-dir` to change this.
 
 ## Recovery behavior
 

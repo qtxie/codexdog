@@ -167,7 +167,13 @@ func TestTurnStartedWhilePausedIsInterrupted(t *testing.T) {
 	s.handleServerMessage(rpcMessage{Method: "turn/started", Params: map[string]any{
 		"threadId": "thread-1", "turn": map[string]any{"id": "unexpected", "status": "inProgress"},
 	}})
-	waitFor(t, func() bool { return s.stateSnapshot().ActiveTurnID == "" && s.stateSnapshot().Phase == "paused" })
+	waitFor(t, func() bool {
+		state := s.stateSnapshot()
+		s.mu.Lock()
+		interrupting := s.pauseInterruptingTurns["unexpected"]
+		s.mu.Unlock()
+		return state.ActiveTurnID == "" && state.Phase == "paused" && !interrupting
+	})
 	if got := proxy.methods(); fmt.Sprint(got) != "[turn/interrupt]" {
 		t.Fatalf("methods = %v", got)
 	}

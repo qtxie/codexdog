@@ -51,6 +51,7 @@ type supervisorState struct {
 	NextProbeAt                    string                    `json:"nextProbeAt,omitempty"`
 	LastError                      string                    `json:"lastError,omitempty"`
 	TelegramEnabled                bool                      `json:"telegramEnabled,omitempty"`
+	TelegramAlias                  string                    `json:"telegramAlias,omitempty"`
 	TelegramLastError              string                    `json:"telegramLastError,omitempty"`
 	TelegramLastUpdateAt           string                    `json:"telegramLastUpdateAt,omitempty"`
 	WeChatEnabled                  bool                      `json:"wechatEnabled,omitempty"`
