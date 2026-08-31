@@ -187,6 +187,69 @@ Options such as `danger-full-access` retain their normal Codex meaning and risk.
 Codexdog does not add a safety boundary around the selected Codex sandbox or
 approval policy.
 
+### Project configuration
+
+When `start` has a workspace selected by `-C`, Codexdog automatically reads an
+optional `.codexdog` file from that workspace. TOML is the documented format:
+
+```toml
+version = 1
+codex = "codex"
+codex_config = [
+  'model="gpt-5.6-sol"',
+  'model_reasoning_effort="high"',
+]
+probe_timeout_ms = 120000
+tui_args = ["resume", "-s", "danger-full-access"]
+
+[telegram]
+alias = "sub2"
+token_file = "secrets/telegram-token.txt"
+chat_ids = [-1001234567890]
+user_ids = [123456789]
+poll_timeout_sec = 30
+notify = true
+
+[wechat]
+user_ids = ["your-ilink-user-id"]
+poll_timeout_sec = 35
+notify = true
+```
+
+This makes the project command self-contained:
+
+```powershell
+codexdog start -C D:\EE\QW\sub2api
+```
+
+Top-level recovery setting names match their long CLI options with hyphens
+changed to underscores. `codex_config` and `tui_args` are arrays. The Telegram
+table also accepts `token`, `no_notify`, and `disabled`; prefer `token_file` or
+`CODEXDOG_TELEGRAM_BOT_TOKEN` so a secret is not committed with the project.
+The WeChat table also accepts `login_timeout_sec`, `no_browser`, `no_notify`,
+and `disabled`.
+
+Relative `state_dir`, `telegram.token_file`, and path-like `codex` values are
+resolved from the directory containing `.codexdog`. Values are applied in this
+order: built-in defaults, environment variables, `.codexdog`, then explicit
+command-line options. Repeatable IDs and `-c` entries from the command line are
+added after configured entries. Explicit TUI arguments after a command-line
+`--` replace `tui_args` from the file.
+
+For a shared multi-session Telegram hub, leave `state_dir` at its platform
+default or set the same absolute/shared directory in every project. A distinct
+relative state directory creates a separate hub for that project.
+
+Project configuration is loaded only by `start`; `status`, `stop`, and other
+management commands do not load it. A JSON object, JSON argument array, or a
+line-oriented CLI argument file is also accepted for automation, but TOML is
+the stable human-facing format. The file may not set `-C` or `--cwd` because
+its location already defines the workspace.
+
+For compatibility with older scripts, `--session NAME` and top-level
+`session = "NAME"` are accepted aliases for `--telegram-alias` and
+`[telegram].alias`.
+
 ## Native agents and queued work
 
 The proxy pins the spawned Codex TUI as the primary control connection. This
@@ -500,12 +563,14 @@ The main options are:
 | `--stall-interrupt-timeout-ms MS` | Interrupt and status RPC timeout. | `15000` |
 | `--max-stall-resumes N` | Consecutive stall recovery limit. | `2` |
 | `--tool-stall-timeout-ms MS` | Silent active-tool timeout; `0` disables it. | `0` |
+| `--telegram-token TOKEN` | Set the Telegram bot token directly; prefer an environment variable or private file. | None |
 | `--telegram-token-file PATH` | Read the Telegram bot token from a file. | None |
 | `--telegram-chat-id ID` | Allow a chat; repeatable. | None |
 | `--telegram-user-id ID` | Allow a sender; repeatable and optional. | None |
 | `--telegram-poll-timeout-sec N` | Telegram long-poll duration from 1 to 50 seconds. | `30` |
 | `--telegram-no-notify` | Disable unsolicited Telegram notifications. | Notifications enabled |
 | `--telegram-alias NAME` | Register this supervisor with the shared Telegram hub. | None |
+| `--session NAME` | Alias for `--telegram-alias`. | None |
 | `--telegram-disabled` | Ignore inherited Telegram configuration. | Off |
 | `--wechat-user-id ID` | Allow an iLink sender; repeatable. With none, only `/uid` works. | None |
 | `--wechat-poll-timeout-sec N` | iLink long-poll duration from 1 to 50 seconds. | `35` |

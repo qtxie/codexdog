@@ -39,6 +39,48 @@ amd64, Windows x86_64, and macOS arm64 binaries with SHA-256 checksum files.
 codexdog start -C D:\path\to\repo
 ```
 
+For project-specific defaults, create a TOML file named `.codexdog` in that
+workspace. For example, `D:\EE\QW\sub2api\.codexdog` can contain:
+
+```toml
+version = 1
+codex_config = ['model="gpt-5.6-sol"']
+tui_args = ["resume", "-s", "danger-full-access"]
+
+[telegram]
+alias = "sub2"
+```
+
+Then this command reads the file automatically:
+
+```powershell
+codexdog start -C D:\EE\QW\sub2api
+```
+
+The first aliased session that creates the Telegram hub also needs the global
+bot token and chat allowlist. Keep those in environment variables, or add a
+private relative token file and IDs to the table:
+
+```toml
+[telegram]
+alias = "sub2"
+token_file = "secrets/telegram-token.txt"
+chat_ids = [-1001234567890]
+user_ids = [123456789]
+```
+
+Relative `state_dir`, `telegram.token_file`, and path-like `codex` values are
+resolved from the project root. Command-line options override `.codexdog`,
+which overrides environment variables. Only `start` loads the project config;
+management commands continue to use their explicit `-C` and options. Avoid
+committing bot tokens or token files.
+
+When several projects share one Telegram bot, keep the default/shared state
+directory; a different relative `state_dir` gives each project its own hub.
+
+`--session NAME` and a top-level `session = "NAME"` are accepted aliases for
+`--telegram-alias` and `[telegram].alias` when integrating with older scripts.
+
 Pass Codex configuration overrides with repeatable `-c` flags. Put all other Codex TUI arguments after `--`:
 
 ```powershell

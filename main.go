@@ -16,7 +16,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-const version = "0.5.0"
+const version = "0.6.0"
 
 var defaultBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 60 * time.Second}
 
@@ -177,6 +177,19 @@ func run(argv []string) (int, error) {
 }
 
 func parseArguments(argv []string) (parsedArguments, error) {
+	config, err := loadProjectConfigArguments(argv)
+	if err != nil {
+		return parsedArguments{}, err
+	}
+	merged, err := mergeProjectConfigArguments(argv, config)
+	if err != nil {
+		return parsedArguments{}, err
+	}
+	configApplied := config.Path != "" && (len(config.Flags) > 0 || len(config.TUIArgs) > 0)
+	return parseArgumentsWithProjectConfig(merged, config.Presence, configApplied)
+}
+
+func parseArgumentsWithProjectConfig(argv []string, configPresence projectConfigPresence, configApplied bool) (parsedArguments, error) {
 	command := "start"
 	index := 0
 	if len(argv) > 0 {
@@ -213,35 +226,45 @@ func parseArguments(argv []string) (parsedArguments, error) {
 		WeChatPollTimeout: 35 * time.Second, WeChatLoginTimeout: wechatDefaultLoginTimeout, WeChatOpenBrowser: true, WeChatNotify: true,
 	}
 	telegramDisabledRequested := hasTelegramDisabledFlag(argv)
+	wechatDisabledRequested := hasWeChatDisabledFlag(argv)
 	options.TelegramDisabled = telegramDisabledRequested
+	options.WeChatDisabled = wechatDisabledRequested
 	if !telegramDisabledRequested {
-		if token := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_BOT_TOKEN")); token != "" {
-			options.TelegramToken = token
-		}
-		if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_CHAT_IDS")); value != "" {
-			parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_CHAT_IDS")
-			if err != nil {
-				return parsedArguments{}, err
+		if !configPresence.TelegramToken && !configPresence.TelegramTokenFile {
+			if token := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_BOT_TOKEN")); token != "" {
+				options.TelegramToken = token
 			}
-			options.TelegramAllowedChats = append(options.TelegramAllowedChats, parsed...)
 		}
-		if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_USER_IDS")); value != "" {
-			parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_USER_IDS")
-			if err != nil {
-				return parsedArguments{}, err
+		if !configPresence.TelegramChatIDs {
+			if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_CHAT_IDS")); value != "" {
+				parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_CHAT_IDS")
+				if err != nil {
+					return parsedArguments{}, err
+				}
+				options.TelegramAllowedChats = append(options.TelegramAllowedChats, parsed...)
 			}
-			options.TelegramAllowedUsers = append(options.TelegramAllowedUsers, parsed...)
+		}
+		if !configPresence.TelegramUserIDs {
+			if value := strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_USER_IDS")); value != "" {
+				parsed, err := parseInt64List(value, "CODEXDOG_TELEGRAM_USER_IDS")
+				if err != nil {
+					return parsedArguments{}, err
+				}
+				options.TelegramAllowedUsers = append(options.TelegramAllowedUsers, parsed...)
+			}
 		}
 	}
-	if value := strings.TrimSpace(os.Getenv("CODEXDOG_WECHAT_USER_IDS")); value != "" {
-		parsed, err := parseStringList(value, "CODEXDOG_WECHAT_USER_IDS")
-		if err != nil {
-			return parsedArguments{}, err
+	if !wechatDisabledRequested && !configPresence.WeChatUserIDs {
+		if value := strings.TrimSpace(os.Getenv("CODEXDOG_WECHAT_USER_IDS")); value != "" {
+			parsed, err := parseStringList(value, "CODEXDOG_WECHAT_USER_IDS")
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.WeChatAllowedUsers = append(options.WeChatAllowedUsers, parsed...)
 		}
-		options.WeChatAllowedUsers = append(options.WeChatAllowedUsers, parsed...)
 	}
 	telegramTokenFile := ""
-	if !telegramDisabledRequested {
+	if !telegramDisabledRequested && !configPresence.TelegramToken && !configPresence.TelegramTokenFile {
 		telegramTokenFile = strings.TrimSpace(os.Getenv("CODEXDOG_TELEGRAM_TOKEN_FILE"))
 	}
 	jsonOutput := false
@@ -388,12 +411,26 @@ func parseArguments(argv []string) (parsedArguments, error) {
 				return parsedArguments{}, err
 			}
 			options.ToolStallTimeout = time.Duration(parsed) * time.Millisecond
+		case "--telegram-token":
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			value = strings.TrimSpace(value)
+			if value == "" {
+				return parsedArguments{}, fmt.Errorf("%s requires a non-empty token", arg)
+			}
+			options.TelegramToken = value
+			telegramTokenFile = ""
 		case "--telegram-token-file":
 			value, err := valueAfter(arg)
 			if err != nil {
 				return parsedArguments{}, err
 			}
 			telegramTokenFile = value
+			if configApplied {
+				options.TelegramToken = ""
+			}
 		case "--telegram-chat-id":
 			value, err := valueAfter(arg)
 			if err != nil {
@@ -429,7 +466,7 @@ func parseArguments(argv []string) (parsedArguments, error) {
 			options.TelegramPollTimeout = time.Duration(parsed) * time.Second
 		case "--telegram-no-notify":
 			options.TelegramNotify = false
-		case "--telegram-alias":
+		case "--telegram-alias", "--session":
 			value, err := valueAfter(arg)
 			if err != nil {
 				return parsedArguments{}, err
@@ -553,18 +590,42 @@ func hasTelegramDisabledFlag(argv []string) bool {
 		if arg == "--telegram-disabled" {
 			return true
 		}
-		switch arg {
-		case "-C", "--cwd", "--codex", "--state-dir", "--health-url", "--probe-model",
-			"--probe-timeout-ms", "--probe-successes", "--error-grace-ms", "--max-auto-resumes",
-			"--stall-timeout-ms", "--stall-confirm-ms", "--stall-interrupt-timeout-ms",
-			"--max-stall-resumes", "--tool-stall-timeout-ms", "--telegram-token-file",
-			"--telegram-chat-id", "--telegram-user-id", "--telegram-poll-timeout-sec",
-			"--telegram-alias", "--wechat-user-id", "--wechat-poll-timeout-sec",
-			"--wechat-login-timeout-sec", "--backoff-ms", "-c", "--config":
+		if optionTakesValue(arg) {
 			index++
 		}
 	}
 	return false
+}
+
+func hasWeChatDisabledFlag(argv []string) bool {
+	for index := 0; index < len(argv); index++ {
+		arg := argv[index]
+		if arg == "--" {
+			return false
+		}
+		if arg == "--wechat-disabled" {
+			return true
+		}
+		if optionTakesValue(arg) {
+			index++
+		}
+	}
+	return false
+}
+
+func optionTakesValue(arg string) bool {
+	switch arg {
+	case "-C", "--cwd", "--codex", "--state-dir", "--health-url", "--probe-model",
+		"--probe-timeout-ms", "--probe-successes", "--error-grace-ms", "--max-auto-resumes",
+		"--stall-timeout-ms", "--stall-confirm-ms", "--stall-interrupt-timeout-ms",
+		"--max-stall-resumes", "--tool-stall-timeout-ms", "--telegram-token", "--telegram-token-file",
+		"--telegram-chat-id", "--telegram-user-id", "--telegram-poll-timeout-sec",
+		"--telegram-alias", "--session", "--wechat-user-id", "--wechat-poll-timeout-sec",
+		"--wechat-login-timeout-sec", "--backoff-ms", "-c", "--config":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseTelegramID(value, flag string) (int64, error) {
@@ -696,6 +757,7 @@ Usage:
 
 Options:
   -C, --cwd DIR               Workspace to open (default: current directory)
+                               start also reads DIR/.codexdog when present
   --codex PATH                Codex executable (default: codex)
   -c, --config KEY=VALUE      Codex config override; repeatable
   --health-url URL            Optional cheap health endpoint checked before canaries
@@ -711,6 +773,7 @@ Options:
                                Interrupt/confirmation RPC timeout (default: 15000)
   --max-stall-resumes N       Consecutive stalled-turn resume limit (default: 2)
   --tool-stall-timeout-ms MS  Silent active-tool timeout; 0 disables it (default: 0)
+  --telegram-token TOKEN      Set the bot token directly (prefer env or token file)
   --telegram-token-file PATH  Read the Telegram bot token from a private file
   --telegram-chat-id ID       Allow a Telegram chat; repeatable
   --telegram-user-id ID       Optionally restrict allowed senders; repeatable
@@ -718,6 +781,7 @@ Options:
                                Long-poll timeout from 1 to 50 seconds (default: 30)
   --telegram-no-notify         Disable unsolicited lifecycle notifications
   --telegram-alias NAME        Register this session with the shared Telegram hub
+  --session NAME               Alias for --telegram-alias
   --telegram-disabled          Ignore inherited Telegram configuration
   --wechat-user-id ID          Allow a WeChat iLink user; repeatable
   --wechat-poll-timeout-sec N  iLink long-poll timeout from 1 to 50 seconds (default: 35)
