@@ -82,6 +82,24 @@ disabled = true
 	}
 }
 
+func TestProjectConfigLoadsFromCurrentDirectory(t *testing.T) {
+	clearProjectConfigEnvironment(t)
+	workspace := t.TempDir()
+	writeProjectConfigFile(t, workspace, "probe_timeout_ms = 4321")
+	t.Chdir(workspace)
+
+	args, err := parseArguments([]string{"start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Options.CWD != workspace {
+		t.Fatalf("cwd = %q, want %q", args.Options.CWD, workspace)
+	}
+	if args.Options.ProbeTimeout != 4321*time.Millisecond {
+		t.Fatalf("probe timeout = %s", args.Options.ProbeTimeout)
+	}
+}
+
 func TestProjectConfigCommandLineOverrides(t *testing.T) {
 	clearProjectConfigEnvironment(t)
 	workspace := t.TempDir()
