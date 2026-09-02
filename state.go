@@ -45,6 +45,11 @@ type supervisorState struct {
 	StallRecoveryCount             int                       `json:"stallRecoveryCount"`
 	ProbeAttempt                   int                       `json:"probeAttempt"`
 	ConsecutiveProbeSuccesses      int                       `json:"consecutiveProbeSuccesses"`
+	HealthState                    string                    `json:"healthState,omitempty"`
+	HealthDetail                   string                    `json:"healthDetail,omitempty"`
+	HealthModel                    string                    `json:"healthModel,omitempty"`
+	HealthProvider                 string                    `json:"healthProvider,omitempty"`
+	HealthObservations             []healthObservationState  `json:"healthObservations,omitempty"`
 	LastTurnActivityAt             string                    `json:"lastTurnActivityAt,omitempty"`
 	StallSuspectedAt               string                    `json:"stallSuspectedAt,omitempty"`
 	StallPausedReason              string                    `json:"stallPausedReason,omitempty"`

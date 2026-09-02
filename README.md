@@ -175,6 +175,11 @@ session therefore leaves the bot and other sessions running. It uses one HTTPS
 long-poll stream and only calls each supervisor's authenticated loopback control
 API. It never exposes a public port or a general Codex JSON-RPC tunnel.
 
+Codexdog holds a user-level lock keyed by a hash of the bot token, so an
+embedded controller or a second hub cannot accidentally replace that long-poll
+stream. This protection also applies when projects use different state
+directories.
+
 The available commands are:
 
 ```text
@@ -332,10 +337,32 @@ A suspected turn must remain silent through `--stall-confirm-ms` and still repor
 --max-stall-resumes 2
 --tool-stall-timeout-ms 0
 --health-url https://provider.example/health
+--health-source https://status.ciii.club/status/codex
+--health-source https://status.input.im/
+--health-policy any
+--health-unknown-policy canary
+--health-max-age-ms 180000
 --probe-model model-name
 ```
 
-When `--health-url` is omitted, recovery uses the ephemeral Codex canary directly. The health URL is optional and should be a cheap endpoint for the custom provider. Any non-`2xx` response, including `400` or `404`, is treated as unhealthy and retried with the configured backoff. A successful endpoint check still requires the configured number of Codex canaries before resuming.
+When neither health option is configured, recovery uses the ephemeral Codex canary directly. Legacy `--health-url` should be a cheap endpoint for the custom provider. Any non-`2xx` response, including `400` or `404`, is treated as unhealthy and retried with the configured backoff. A successful endpoint check still requires the configured number of Codex canaries before resuming.
+
+`--health-source` supports model-aware status dashboards. A bare Ciii or Input.im
+URL is detected automatically; `uptime-kuma=URL`, `input-im=URL`, and
+`http=URL` select an adapter explicitly. Status observations can only skip an
+expensive canary while a model is known to be down. A healthy or unavailable
+dashboard never replaces the real Codex canary. Use either legacy
+`--health-url` or typed health sources, not both.
+
+```powershell
+codexdog start -C . `
+  --health-source https://status.ciii.club/status/codex `
+  --probe-model gpt-5.6-sol
+
+codexdog start -C . `
+  --health-source https://status.input.im/ `
+  --probe-model gpt-5.6-sol
+```
 
 ## Compatibility checks
 

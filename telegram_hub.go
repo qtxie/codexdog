@@ -204,7 +204,6 @@ type telegramHub struct {
 	watchers  map[string]context.CancelFunc
 	workers   map[string]chan telegramHubCommandJob
 	wg        sync.WaitGroup
-	fatalErr  error
 }
 
 type telegramHubCommandJob struct {
@@ -263,7 +262,7 @@ func initializeTelegramHubState(state *telegramHubState) {
 	}
 }
 
-func (h *telegramHub) Run() (runErr error) {
+func (h *telegramHub) Run() error {
 	lock, err := acquireTelegramHubLock(h.store)
 	if err != nil {
 		return err
@@ -273,9 +272,23 @@ func (h *telegramHub) Run() (runErr error) {
 		return err
 	}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
-	if err := h.preflightTelegram(); err != nil {
+	if err := h.telegram.acquirePollLock(); err != nil {
 		h.mu.Lock()
 		h.state.Phase = "stopped"
+		h.state.ControlPort = 0
+		h.state.ControlToken = ""
+		h.state.TelegramLastError = sanitizeText(err.Error())
+		h.state.StoppedReason = "Telegram startup failed"
+		h.mu.Unlock()
+		_ = h.persist()
+		return err
+	}
+	if err := h.preflightTelegram(); err != nil {
+		h.telegram.releasePollLock()
+		h.mu.Lock()
+		h.state.Phase = "stopped"
+		h.state.ControlPort = 0
+		h.state.ControlToken = ""
 		h.state.TelegramLastError = sanitizeText(err.Error())
 		h.state.StoppedReason = "Telegram startup failed"
 		h.mu.Unlock()
@@ -284,6 +297,7 @@ func (h *telegramHub) Run() (runErr error) {
 	}
 	control, err := startTelegramHubControl(h)
 	if err != nil {
+		h.telegram.releasePollLock()
 		return err
 	}
 	h.control = control
@@ -295,10 +309,20 @@ func (h *telegramHub) Run() (runErr error) {
 	h.mu.Unlock()
 	if err := h.persist(); err != nil {
 		_ = control.Close()
+		h.telegram.releasePollLock()
 		return err
 	}
 	if err := h.telegram.Start(h.ctx); err != nil {
 		_ = control.Close()
+		h.telegram.releasePollLock()
+		h.mu.Lock()
+		h.state.Phase = "stopped"
+		h.state.ControlPort = 0
+		h.state.ControlToken = ""
+		h.state.TelegramLastError = sanitizeText(err.Error())
+		h.state.StoppedReason = "Telegram startup failed"
+		h.mu.Unlock()
+		_ = h.persist()
 		return err
 	}
 	h.syncSessionWatchers()
@@ -321,10 +345,16 @@ func (h *telegramHub) Run() (runErr error) {
 	if h.state.Phase == "running" {
 		h.state.Phase = "stopping"
 	}
+	stopReason := strings.TrimSpace(h.state.StoppedReason)
 	h.mu.Unlock()
 	_ = h.persist()
+	if stopReason == "" {
+		h.logger.Log("Telegram multi-session hub stopping")
+	} else {
+		h.logger.Log("Telegram multi-session hub stopping: " + sanitizeText(stopReason))
+	}
 	h.cancel()
-	h.telegram.SendFinal("Codexdog Telegram hub is stopping.")
+	h.telegram.SendFinal(telegramHubStopNotification(h.snapshot()))
 	h.telegram.Stop()
 	_ = control.Close()
 	h.mu.Lock()
@@ -339,11 +369,18 @@ func (h *telegramHub) Run() (runErr error) {
 	h.state.ControlPort = 0
 	h.state.ControlToken = ""
 	h.state.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	runErr = h.fatalErr
 	h.mu.Unlock()
 	_ = h.persist()
 	h.logger.Log("Telegram multi-session hub stopped")
-	return runErr
+	return nil
+}
+
+func telegramHubStopNotification(state telegramHubState) string {
+	reason := strings.TrimSpace(state.StoppedReason)
+	if reason == "" || strings.EqualFold(reason, "stop requested") {
+		return "Codexdog Telegram hub is stopping."
+	}
+	return "Codexdog Telegram hub is stopping: " + sanitizeText(reason) + "."
 }
 
 func (h *telegramHub) preflightTelegram() error {
@@ -358,9 +395,18 @@ func (h *telegramHub) preflightTelegram() error {
 		}
 	}
 	if _, err := h.telegram.client.GetUpdates(ctx, h.telegram.poller.Offset(), 0); err != nil {
+		if isTelegramPollingConflict(err) {
+			h.recordTelegramState(fmt.Errorf("Telegram getUpdates preflight: %w", err))
+			return nil
+		}
 		return fmt.Errorf("Telegram getUpdates preflight: %w", err)
 	}
 	return nil
+}
+
+func isTelegramPollingConflict(err error) bool {
+	var apiErr *telegramAPIError
+	return errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusConflict || apiErr.ErrorCode == http.StatusConflict)
 }
 
 func (h *telegramHub) snapshot() telegramHubState {
@@ -404,15 +450,6 @@ func (h *telegramHub) recordTelegramState(err error) {
 		h.state.TelegramLastError = ""
 	} else {
 		h.state.TelegramLastError = sanitizeText(err.Error())
-		var apiErr *telegramAPIError
-		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusConflict || apiErr.ErrorCode == http.StatusConflict) {
-			h.fatalErr = errors.New("Telegram rejected getUpdates because another process is polling this bot token")
-			h.state.StoppedReason = h.fatalErr.Error()
-			h.state.Phase = "stopping"
-			if h.cancel != nil {
-				h.cancel()
-			}
-		}
 	}
 	h.mu.Unlock()
 	_ = h.persist()
@@ -1329,6 +1366,7 @@ func runTelegramManagement(args parsedArguments) (int, error) {
 			sort.Strings(aliases)
 			fmt.Printf("Sessions: %s\n", valueOrDash(strings.Join(aliases, ", ")))
 			fmt.Printf("Last Telegram error: %s\n", valueOrDash(state.TelegramLastError))
+			fmt.Printf("Stopped reason: %s\n", valueOrDash(state.StoppedReason))
 		}
 		if live {
 			return 0, nil

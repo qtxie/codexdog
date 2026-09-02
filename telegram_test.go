@@ -269,6 +269,81 @@ func TestTelegramOffsetPersistence(t *testing.T) {
 	}
 }
 
+func TestTelegramPollLockCoordinatesControllers(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "telegram-session.json")
+	derived := telegramPollLockPath(statePath, "123456:secret")
+	if derived == "" || strings.Contains(derived, "123456") || strings.Contains(derived, "secret") {
+		t.Fatalf("poll lock path leaked token: %q", derived)
+	}
+	path := filepath.Join(root, "telegram-poll.lock")
+	first, err := acquireTelegramPollLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := acquireTelegramPollLock(path)
+	if err == nil || second != nil || !strings.Contains(err.Error(), "already polling") {
+		t.Fatalf("duplicate poll lock result lock=%#v err=%v", second, err)
+	}
+	first.Release()
+	third, err := acquireTelegramPollLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third.Release()
+}
+
+func TestTelegramPollLockIsSharedAcrossStateDirectories(t *testing.T) {
+	first := telegramPollLockPath(filepath.Join(t.TempDir(), "telegram.json"), "same-token")
+	second := telegramPollLockPath(filepath.Join(t.TempDir(), "telegram.json"), "same-token")
+	if first == "" || first != second {
+		t.Fatalf("same token produced state-scoped locks %q and %q", first, second)
+	}
+	if first == telegramPollLockPath(filepath.Join(t.TempDir(), "telegram.json"), "different-token") {
+		t.Fatal("different Telegram tokens shared one polling lock")
+	}
+}
+
+func TestTelegramControllerRejectsConcurrentStartWithoutReleasingLock(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "telegram-poll.lock")
+	controller := &telegramController{
+		client:       &telegramControllerFakeAPI{sent: make(chan telegramOutbound, 1)},
+		poller:       mustTelegramPoller(t, &telegramControllerFakeAPI{sent: make(chan telegramOutbound, 1)}),
+		pollLockPath: lockPath,
+		out:          make(chan telegramOutbound, 1),
+	}
+	controller.mu.Lock()
+	controller.starting = true
+	controller.mu.Unlock()
+	if err := controller.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "starting or running") {
+		t.Fatalf("concurrent start error = %v", err)
+	}
+	controller.mu.Lock()
+	controller.starting = false
+	controller.mu.Unlock()
+	if err := controller.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireTelegramPollLock(lockPath); err == nil {
+		t.Fatal("running controller did not retain its polling lock")
+	}
+	controller.Stop()
+	lock, err := acquireTelegramPollLock(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock.Release()
+}
+
+func mustTelegramPoller(t *testing.T, api telegramBotAPI) *telegramPoller {
+	t.Helper()
+	poller, err := newTelegramPoller(api, telegramPollerOptions{PollTimeout: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return poller
+}
+
 func TestTelegramControllerDispatchesOnlyAllowedCommands(t *testing.T) {
 	api := &telegramControllerFakeAPI{sent: make(chan telegramOutbound, 4), updates: []telegramUpdate{
 		{UpdateID: 1, Message: &telegramMessage{Chat: telegramChat{ID: 10}, From: &telegramUser{ID: 20}, Text: "/status"}},

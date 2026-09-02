@@ -24,6 +24,7 @@ type supervisorOptions struct {
 	CodexConfig           []string
 	TUIArgs               []string
 	HealthURL             string
+	HealthChecks          healthCheckOptions
 	ProbeModel            string
 	ProbeTimeout          time.Duration
 	TerminalErrorGrace    time.Duration
@@ -249,14 +250,15 @@ func (s *supervisor) Run() (int, error) {
 	if err := rpc.Connect(context.Background()); err != nil {
 		return s.startupFailure(err)
 	}
-	if err := rpc.Initialize(context.Background()); err != nil {
+	probeClientInfo := proxy.PrimaryClientIdentity()
+	if err := rpc.InitializeWithClientInfo(context.Background(), probeClientInfo, false); err != nil {
 		return s.startupFailure(err)
 	}
 	s.mu.Lock()
 	s.rpc = rpc
 	s.usageRPC = rpc
 	s.mu.Unlock()
-	s.probe = newProviderProbe(rpc, providerProbeOptions{CWD: s.options.CWD, Timeout: s.options.ProbeTimeout, HealthURL: s.options.HealthURL, Model: s.options.ProbeModel})
+	s.probe = newProviderProbe(rpc, providerProbeOptions{CWD: s.options.CWD, Timeout: s.options.ProbeTimeout, HealthURL: s.options.HealthURL, HealthChecks: s.options.HealthChecks, Model: s.options.ProbeModel})
 	queueClient := newJSONRPCClient(appURL, rpcTimeout)
 	if err := queueClient.Connect(context.Background()); err != nil {
 		s.logger.Log("Experimental queue API unavailable: " + err.Error())
@@ -2039,9 +2041,27 @@ func (s *supervisor) runRecovery(ctx context.Context, recovery recoveryContext) 
 		}
 		s.modifyState(func(state *supervisorState) { state.Phase = "probing"; state.NextProbeAt = "" })
 		_ = s.persist()
-		result := s.probe.Check(ctx)
+		state := s.stateSnapshot()
+		result := s.probe.Check(ctx, state.Model, state.ModelProvider)
 		if ctx.Err() != nil {
 			return nil
+		}
+		healthModel := strings.TrimSpace(s.options.ProbeModel)
+		if s.probe.health != nil {
+			healthModel = s.probe.health.targetModelForProvider(healthModel, state.Model, state.ModelProvider)
+		} else if healthModel == "" {
+			healthModel = state.Model
+		}
+		s.modifyState(func(current *supervisorState) {
+			current.HealthState = result.HealthState
+			current.HealthDetail = sanitizeText(result.HealthDetail)
+			current.HealthModel = healthModel
+			current.HealthProvider = state.ModelProvider
+			current.HealthObservations = healthObservationStates(result.HealthObservations)
+		})
+		_ = s.persist()
+		for _, observation := range result.HealthObservations {
+			s.logger.Log(formatHealthObservation(observation))
 		}
 		if result.Healthy {
 			successes++

@@ -19,21 +19,26 @@ type doctorCheck struct {
 }
 
 type doctorSupervisor struct {
-	StateFound        bool   `json:"stateFound"`
-	Live              bool   `json:"live"`
-	PID               int    `json:"pid,omitempty"`
-	Phase             string `json:"phase,omitempty"`
-	ThreadID          string `json:"threadId,omitempty"`
-	EffectiveCWD      string `json:"effectiveCwd,omitempty"`
-	PermissionProfile string `json:"permissionProfile,omitempty"`
-	ApprovalPolicy    string `json:"approvalPolicy,omitempty"`
-	SandboxPolicy     string `json:"sandboxPolicy,omitempty"`
-	Model             string `json:"model,omitempty"`
-	ModelProvider     string `json:"modelProvider,omitempty"`
-	PrimaryClient     string `json:"primaryClient,omitempty"`
-	AppServerPort     int    `json:"appServerPort,omitempty"`
-	ProxyPort         int    `json:"proxyPort,omitempty"`
-	ControlPort       int    `json:"controlPort,omitempty"`
+	StateFound         bool                     `json:"stateFound"`
+	Live               bool                     `json:"live"`
+	PID                int                      `json:"pid,omitempty"`
+	Phase              string                   `json:"phase,omitempty"`
+	ThreadID           string                   `json:"threadId,omitempty"`
+	EffectiveCWD       string                   `json:"effectiveCwd,omitempty"`
+	PermissionProfile  string                   `json:"permissionProfile,omitempty"`
+	ApprovalPolicy     string                   `json:"approvalPolicy,omitempty"`
+	SandboxPolicy      string                   `json:"sandboxPolicy,omitempty"`
+	Model              string                   `json:"model,omitempty"`
+	ModelProvider      string                   `json:"modelProvider,omitempty"`
+	PrimaryClient      string                   `json:"primaryClient,omitempty"`
+	AppServerPort      int                      `json:"appServerPort,omitempty"`
+	ProxyPort          int                      `json:"proxyPort,omitempty"`
+	ControlPort        int                      `json:"controlPort,omitempty"`
+	HealthState        string                   `json:"healthState,omitempty"`
+	HealthDetail       string                   `json:"healthDetail,omitempty"`
+	HealthModel        string                   `json:"healthModel,omitempty"`
+	HealthProvider     string                   `json:"healthProvider,omitempty"`
+	HealthObservations []healthObservationState `json:"healthObservations,omitempty"`
 }
 
 type doctorReport struct {
@@ -43,8 +48,19 @@ type doctorReport struct {
 	CodexCheck    doctorCheck          `json:"codexDoctorCheck"`
 	Schema        protocolSchemaReport `json:"schema"`
 	ProtocolSmoke doctorCheck          `json:"protocolSmoke"`
+	HealthSources *doctorHealthSources `json:"healthSources,omitempty"`
 	Canary        *doctorCheck         `json:"canary,omitempty"`
 	Supervisor    doctorSupervisor     `json:"supervisor"`
+}
+
+type doctorHealthSources struct {
+	Status        string                   `json:"status"`
+	Detail        string                   `json:"detail,omitempty"`
+	Policy        string                   `json:"policy"`
+	UnknownPolicy string                   `json:"unknownPolicy"`
+	Model         string                   `json:"model,omitempty"`
+	Provider      string                   `json:"provider,omitempty"`
+	Observations  []healthObservationState `json:"observations,omitempty"`
 }
 
 func runDoctor(options supervisorOptions, store *stateStore, jsonOutput, canary bool) (int, error) {
@@ -81,6 +97,7 @@ func runDoctor(options supervisorOptions, store *stateStore, jsonOutput, canary 
 	} else {
 		report.ProtocolSmoke = doctorCheck{Status: "pass"}
 	}
+	report.HealthSources = checkDoctorHealthSources(context.Background(), options, report.Supervisor.Model, report.Supervisor.ModelProvider)
 	if canary {
 		check := doctorCheck{Status: "pass"}
 		if code, err := runProtocolSmokeWithOutput(options, true, false); err != nil || code != 0 {
@@ -107,23 +124,58 @@ func runDoctor(options supervisorOptions, store *stateStore, jsonOutput, canary 
 	return 0, nil
 }
 
+func checkDoctorHealthSources(ctx context.Context, options supervisorOptions, runtimeModel, runtimeProvider string) *doctorHealthSources {
+	healthOptions := healthOptionsWithLegacyURL(options.HealthChecks, options.HealthURL)
+	if len(healthOptions.Sources) == 0 {
+		return nil
+	}
+	checker := newHealthChecker(healthOptions)
+	model := checker.targetModelForProvider(options.ProbeModel, runtimeModel, runtimeProvider)
+	result := checker.check(ctx, model, runtimeProvider, options.ProbeTimeout)
+	report := &doctorHealthSources{
+		Status:        "warning",
+		Detail:        sanitizeText(result.Detail),
+		Policy:        checker.options.Policy,
+		UnknownPolicy: checker.options.UnknownPolicy,
+		Model:         model,
+		Provider:      runtimeProvider,
+		Observations:  healthObservationStates(result.Observations),
+	}
+	switch result.State {
+	case healthStateHealthy:
+		report.Status = "pass"
+	case healthStateUnhealthy:
+		report.Status = "fail"
+	case healthStateUnknown:
+		if checker.options.UnknownPolicy == healthUnknownBlock {
+			report.Status = "fail"
+		}
+	}
+	return report
+}
+
 func doctorSupervisorFromState(state supervisorState, live bool) doctorSupervisor {
 	return doctorSupervisor{
-		StateFound:        true,
-		Live:              live,
-		PID:               state.PID,
-		Phase:             state.Phase,
-		ThreadID:          state.CurrentThreadID,
-		EffectiveCWD:      state.EffectiveCWD,
-		PermissionProfile: state.ActivePermissionProfile,
-		ApprovalPolicy:    state.ApprovalPolicy,
-		SandboxPolicy:     state.SandboxPolicy,
-		Model:             state.Model,
-		ModelProvider:     state.ModelProvider,
-		PrimaryClient:     formatClientIdentity(state.PrimaryClient, state.PrimaryClientVersion),
-		AppServerPort:     state.AppServerPort,
-		ProxyPort:         state.ProxyPort,
-		ControlPort:       state.ControlPort,
+		StateFound:         true,
+		Live:               live,
+		PID:                state.PID,
+		Phase:              state.Phase,
+		ThreadID:           state.CurrentThreadID,
+		EffectiveCWD:       state.EffectiveCWD,
+		PermissionProfile:  state.ActivePermissionProfile,
+		ApprovalPolicy:     state.ApprovalPolicy,
+		SandboxPolicy:      state.SandboxPolicy,
+		Model:              state.Model,
+		ModelProvider:      state.ModelProvider,
+		PrimaryClient:      formatClientIdentity(state.PrimaryClient, state.PrimaryClientVersion),
+		AppServerPort:      state.AppServerPort,
+		ProxyPort:          state.ProxyPort,
+		ControlPort:        state.ControlPort,
+		HealthState:        state.HealthState,
+		HealthDetail:       state.HealthDetail,
+		HealthModel:        state.HealthModel,
+		HealthProvider:     state.HealthProvider,
+		HealthObservations: append([]healthObservationState(nil), state.HealthObservations...),
 	}
 }
 
@@ -240,6 +292,9 @@ func doctorFailed(report doctorReport) bool {
 	if report.Compatibility.Status == "fail" || report.CodexCheck.Status == "fail" || report.Schema.Status == "fail" || report.ProtocolSmoke.Status == "fail" {
 		return true
 	}
+	if report.HealthSources != nil && report.HealthSources.Status == "fail" {
+		return true
+	}
 	return report.Canary != nil && report.Canary.Status == "fail"
 }
 
@@ -249,6 +304,12 @@ func printDoctorReport(report doctorReport) {
 	fmt.Printf("Codex doctor: %s%s\n", report.CodexCheck.Status, optionalDoctorDetail(report.CodexCheck.Detail))
 	fmt.Printf("Schema: %s%s\n", report.Schema.Status, optionalDoctorDetail(strings.Join(report.Schema.Failures, "; ")))
 	fmt.Printf("Protocol smoke: %s%s\n", report.ProtocolSmoke.Status, optionalDoctorDetail(report.ProtocolSmoke.Detail))
+	if report.HealthSources != nil {
+		fmt.Printf("Status sources: %s%s\n", report.HealthSources.Status, optionalDoctorDetail(report.HealthSources.Detail))
+		for _, observation := range report.HealthSources.Observations {
+			fmt.Println(formatHealthObservationState(observation))
+		}
+	}
 	if report.Canary != nil {
 		fmt.Printf("Provider canary: %s%s\n", report.Canary.Status, optionalDoctorDetail(report.Canary.Detail))
 	}
@@ -258,6 +319,12 @@ func printDoctorReport(report doctorReport) {
 		fmt.Printf("Supervisor phase: %s\n", valueOrDash(report.Supervisor.Phase))
 		fmt.Printf("Supervisor PID: %d\n", report.Supervisor.PID)
 		fmt.Printf("App-server/proxy/control ports: %s/%s/%s\n", valueOrDash(strconv.Itoa(report.Supervisor.AppServerPort)), valueOrDash(strconv.Itoa(report.Supervisor.ProxyPort)), valueOrDash(strconv.Itoa(report.Supervisor.ControlPort)))
+		fmt.Printf("Last provider status: %s\n", valueOrDash(report.Supervisor.HealthState))
+		fmt.Printf("Last provider status target: %s\n", valueOrDash(formatHealthTarget(report.Supervisor.HealthModel, report.Supervisor.HealthProvider)))
+		fmt.Printf("Last provider status detail: %s\n", valueOrDash(report.Supervisor.HealthDetail))
+		for _, observation := range report.Supervisor.HealthObservations {
+			fmt.Println(formatHealthObservationState(observation))
+		}
 	}
 }
 

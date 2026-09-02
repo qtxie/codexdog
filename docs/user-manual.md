@@ -317,10 +317,10 @@ the same policy failure repeats, and finally forks through the failed turn and
 sends `continue` once on the new thread. This sequence does not wait for provider
 health probes.
 
-### Optional health URL
+### Optional health checks
 
-Without `--health-url`, each recovery attempt directly runs an ephemeral Codex
-canary through the configured provider.
+Without `--health-url` or `--health-source`, each recovery attempt directly runs
+an ephemeral Codex canary through the configured provider.
 
 With `--health-url`, Codexdog first sends an HTTP `GET` to that URL. The endpoint
 must be a direct, inexpensive service endpoint that returns a `2xx` response
@@ -341,6 +341,47 @@ codexdog start -C . \
   --probe-successes 2 \
   --probe-timeout-ms 120000
 ```
+
+Status dashboard pages normally return `200` even when an individual model is
+down. Configure them with `--health-source`, which reads the dashboard's JSON
+API and selects the effective probe model:
+
+```text
+codexdog start -C . \
+  --health-source https://status.ciii.club/status/codex \
+  --probe-model gpt-5.6-sol
+
+codexdog start -C . \
+  --health-source https://status.input.im/ \
+  --probe-model gpt-5.6-sol
+```
+
+Bare Ciii and Input.im URLs are detected automatically. The explicit forms are
+`uptime-kuma=URL`, `input-im=URL`, and `http=URL`. Typed sources return one of
+three states:
+
+- `healthy`: a fresh status sample says that the selected model is available;
+- `unhealthy`: a fresh sample says that the selected model is unavailable;
+- `unknown`: the source is unreachable, stale, malformed, or does not list the
+  selected model.
+
+An unhealthy aggregate skips the real canary until the next recovery attempt.
+Healthy status still has to pass the real Codex canary. By default, an unknown
+status falls back to that canary so an external dashboard outage cannot block
+recovery. Set `--health-unknown-policy block` for fail-closed behavior.
+
+With multiple sources, `--health-policy any` accepts one healthy source, rejects
+only when all sources are explicitly unhealthy, and otherwise returns unknown.
+`--health-policy all` rejects any unhealthy source and requires all sources to
+be healthy. Multiple sources should describe the same provider route. A source
+can include a `provider` selector in `.codexdog` when one configuration covers
+multiple providers.
+
+Status samples older than `--health-max-age-ms` (three minutes by default) are
+unknown. Model resolution uses the source's explicit `model`, then
+`--probe-model`, then the failed thread's effective model. Status requests use a
+15-second maximum timeout, accept at most three redirects, and read at most 1
+MiB. No authentication headers are added.
 
 ## Stalled-turn watchdog
 
@@ -552,6 +593,10 @@ The main options are:
 | `--codex PATH` | Codex executable to launch. | `codex` |
 | `-c, --config KEY=VALUE` | Repeatable Codex configuration override. | None |
 | `--health-url URL` | Optional HTTP health precheck. | None |
+| `--health-source SOURCE` | Model-aware source: URL, `TYPE=URL`, or JSON; repeatable. | None |
+| `--health-policy POLICY` | Aggregate typed sources with `any` or `all`. | `any` |
+| `--health-unknown-policy POLICY` | On unknown status, run the canary or block. | `canary` |
+| `--health-max-age-ms MS` | Maximum typed status-sample age. | `180000` |
 | `--probe-model MODEL` | Model used by recovery canaries. | Current Codex model |
 | `--probe-timeout-ms MS` | Maximum duration of a provider canary. | `120000` |
 | `--probe-successes N` | Consecutive canaries required before resume. | `2` |
@@ -611,10 +656,17 @@ at 2 MiB with three rotations and redact common authorization, API-key, and
 token patterns. Review logs before sharing them because arbitrary provider
 messages may still contain sensitive context.
 
+Codexdog also creates one user-level `telegram-poll-*.lock` per bot token in the
+default state directory. This prevents an embedded controller or a second hub,
+including one using another project `state_dir`, from taking over the same
+Telegram long-poll stream. The file name contains only a truncated token hash.
+
 On normal exit, Codexdog shuts down only the app-server and TUI process trees it
 started. It does not scan for or terminate unrelated Codex sessions. On Windows,
 owned processes also run in a kill-on-close Job Object so descendants are
-cleaned up if Codexdog exits unexpectedly.
+cleaned up if Codexdog exits unexpectedly. The detached Telegram hub starts in
+an independent process group, does not inherit handles, and breaks away from an
+inherited parent Job Object, so it can outlive the session that started it.
 
 Prefer `codexdog stop -C WORKSPACE` or exit the attached TUI normally. If the
 state says `needs-attention`, inspect `Last error` and the workspace log, then
@@ -643,12 +695,14 @@ v2 sub-agents`, update Codexdog to a build with multi-agent thread filtering.
 The message means a child thread was mistakenly targeted with a direct
 `thread/resume`/`turn/start`; the parent thread must own that continuation.
 
-### The health URL always fails
+### A provider health check is wrong
 
-Test the exact URL with a plain unauthenticated HTTP `GET`. Dashboard pages,
-redirected login pages, authenticated endpoints, `400`, and `404` responses are
-not healthy endpoints for Codexdog. Omitting `--health-url` uses the real Codex
-canary alone.
+For legacy `--health-url`, test the exact URL with a plain unauthenticated HTTP
+`GET`. Authenticated endpoints, `400`, and `404` responses are unhealthy. Do
+not put a dashboard HTML page in `--health-url`; use `--health-source` for Ciii,
+Input.im, or Uptime Kuma. Check `Health status`, `Health detail`, and each source
+observation in `codexdog status`. Omitting both health options uses the real
+Codex canary alone.
 
 ### Codex appears to work forever without output
 
@@ -664,8 +718,10 @@ Run `codexdog telegram status --json`. Confirm the hub is live and inspect
 token, network connectivity, and access to `api.telegram.org`. The chat allowlist must
 match `message.chat.id`; the optional user allowlist must match
 `message.from.id`. A `409` error means another process is polling the same bot
-token; stop the legacy embedded controller or other hub. Inspect
-`telegramLastError` and `telegram-hub.log`.
+token. Current Codexdog processes on the same machine are rejected by the
+per-token polling lock; conflicts with an older binary, another application, or
+another machine are recorded while the hub remains online and retries. Stop the
+other poller, then inspect `telegramLastError` and `telegram-hub.log`.
 
 If `/sessions` lists a session as offline, run `codexdog status -C WORKSPACE`.
 An alias left by an abruptly terminated supervisor can be reused for the same

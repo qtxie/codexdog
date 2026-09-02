@@ -15,6 +15,7 @@ import (
 const (
 	jobObjectExtendedLimitInformationClass = 9
 	jobObjectLimitKillOnJobClose           = 0x00002000
+	jobObjectLimitBreakawayOK              = 0x00000800
 	processSetQuota                        = 0x0100
 	processTerminate                       = 0x0001
 )
@@ -51,13 +52,17 @@ type processTree struct {
 }
 
 func newProcessTree() (*processTree, error) {
+	return newProcessTreeWithLimits(jobObjectLimitKillOnJobClose)
+}
+
+func newProcessTreeWithLimits(limitFlags uint32) (*processTree, error) {
 	result, _, callErr := createJobObjectW.Call(0, 0)
 	if result == 0 {
 		return nil, windowsCallError("CreateJobObjectW", callErr)
 	}
 	job := syscall.Handle(result)
 	information := jobObjectExtendedLimitInformation{}
-	information.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
+	information.BasicLimitInformation.LimitFlags = limitFlags
 	result, _, callErr = setInformationJobObject.Call(
 		uintptr(job),
 		jobObjectExtendedLimitInformationClass,

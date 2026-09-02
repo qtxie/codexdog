@@ -140,9 +140,9 @@ func TestTUIProxyPinsTheFirstConnectionForInjectedRequests(t *testing.T) {
 	}
 	defer secondary.CloseNow()
 	for index, client := range []*websocket.Conn{primary, secondary} {
-		clientInfo := map[string]any{"name": "auxiliary"}
+		clientInfo := map[string]any{"name": "auxiliary", "version": "1.0.0"}
 		if index == 0 {
-			clientInfo = map[string]any{"name": "primary-tui", "version": "0.149.1"}
+			clientInfo = map[string]any{"name": "primary-tui", "title": "Codex CLI", "version": "0.149.1"}
 		}
 		request, _ := json.Marshal(map[string]any{"id": randomID(), "method": "initialize", "params": map[string]any{"clientInfo": clientInfo}})
 		if err := client.Write(ctx, websocket.MessageText, request); err != nil {
@@ -153,6 +153,9 @@ func TestTUIProxyPinsTheFirstConnectionForInjectedRequests(t *testing.T) {
 		name, clientVersion := proxy.PrimaryClientInfo()
 		return name == "primary-tui" && clientVersion == "0.149.1"
 	})
+	if info := proxy.PrimaryClientIdentity(); info != (appServerClientInfo{Name: "primary-tui", Title: "Codex CLI", Version: "0.149.1"}) {
+		t.Fatalf("primary client identity = %#v", info)
+	}
 	if _, err := proxy.Request(ctx, "thread/read", map[string]any{"threadId": "thread-1"}); err != nil {
 		t.Fatal(err)
 	}

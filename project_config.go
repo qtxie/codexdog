@@ -30,21 +30,22 @@ type projectConfigDocument struct {
 	TUIArgs []string `toml:"tui_args" json:"tuiArgs"`
 	Session *string  `toml:"session" json:"session"`
 
-	Codex                   *string  `toml:"codex" json:"codex"`
-	CodexConfig             []string `toml:"codex_config" json:"codexConfig"`
-	StateDir                *string  `toml:"state_dir" json:"stateDir"`
-	HealthURL               *string  `toml:"health_url" json:"healthUrl"`
-	ProbeModel              *string  `toml:"probe_model" json:"probeModel"`
-	ProbeTimeoutMS          *int64   `toml:"probe_timeout_ms" json:"probeTimeoutMs"`
-	TerminalErrorGraceMS    *int64   `toml:"error_grace_ms" json:"errorGraceMs"`
-	ProbeSuccesses          *int64   `toml:"probe_successes" json:"probeSuccesses"`
-	BackoffMS               []int64  `toml:"backoff_ms" json:"backoffMs"`
-	MaxAutoResumes          *int64   `toml:"max_auto_resumes" json:"maxAutoResumes"`
-	StallTimeoutMS          *int64   `toml:"stall_timeout_ms" json:"stallTimeoutMs"`
-	StallConfirmMS          *int64   `toml:"stall_confirm_ms" json:"stallConfirmMs"`
-	StallInterruptTimeoutMS *int64   `toml:"stall_interrupt_timeout_ms" json:"stallInterruptTimeoutMs"`
-	MaxStallResumes         *int64   `toml:"max_stall_resumes" json:"maxStallResumes"`
-	ToolStallTimeoutMS      *int64   `toml:"tool_stall_timeout_ms" json:"toolStallTimeoutMs"`
+	Codex                   *string             `toml:"codex" json:"codex"`
+	CodexConfig             []string            `toml:"codex_config" json:"codexConfig"`
+	StateDir                *string             `toml:"state_dir" json:"stateDir"`
+	HealthURL               *string             `toml:"health_url" json:"healthUrl"`
+	Health                  projectConfigHealth `toml:"health" json:"health"`
+	ProbeModel              *string             `toml:"probe_model" json:"probeModel"`
+	ProbeTimeoutMS          *int64              `toml:"probe_timeout_ms" json:"probeTimeoutMs"`
+	TerminalErrorGraceMS    *int64              `toml:"error_grace_ms" json:"errorGraceMs"`
+	ProbeSuccesses          *int64              `toml:"probe_successes" json:"probeSuccesses"`
+	BackoffMS               []int64             `toml:"backoff_ms" json:"backoffMs"`
+	MaxAutoResumes          *int64              `toml:"max_auto_resumes" json:"maxAutoResumes"`
+	StallTimeoutMS          *int64              `toml:"stall_timeout_ms" json:"stallTimeoutMs"`
+	StallConfirmMS          *int64              `toml:"stall_confirm_ms" json:"stallConfirmMs"`
+	StallInterruptTimeoutMS *int64              `toml:"stall_interrupt_timeout_ms" json:"stallInterruptTimeoutMs"`
+	MaxStallResumes         *int64              `toml:"max_stall_resumes" json:"maxStallResumes"`
+	ToolStallTimeoutMS      *int64              `toml:"tool_stall_timeout_ms" json:"toolStallTimeoutMs"`
 
 	// Flat Telegram keys are accepted alongside the preferred [telegram] table.
 	TelegramToken          *string `toml:"telegram_token" json:"telegramToken"`
@@ -68,6 +69,13 @@ type projectConfigDocument struct {
 	WeChatNoBrowser       *bool    `toml:"wechat_no_browser" json:"wechatNoBrowser"`
 	WeChatNoNotify        *bool    `toml:"wechat_no_notify" json:"wechatNoNotify"`
 	WeChatDisabled        *bool    `toml:"wechat_disabled" json:"wechatDisabled"`
+}
+
+type projectConfigHealth struct {
+	Policy        *string              `toml:"policy" json:"policy"`
+	UnknownPolicy *string              `toml:"unknown_policy" json:"unknownPolicy"`
+	MaxAgeMS      *int64               `toml:"max_age_ms" json:"maxAgeMs"`
+	Sources       []healthSourceConfig `toml:"sources" json:"sources"`
 }
 
 type projectConfigTelegram struct {
@@ -289,6 +297,16 @@ func projectConfigDocumentArguments(document projectConfigDocument, path string)
 	addStringList("-c", document.CodexConfig)
 	addString("--state-dir", document.StateDir)
 	addString("--health-url", document.HealthURL)
+	addString("--health-policy", document.Health.Policy)
+	addString("--health-unknown-policy", document.Health.UnknownPolicy)
+	addDurationMS("--health-max-age-ms", document.Health.MaxAgeMS, &flags)
+	for _, source := range document.Health.Sources {
+		encoded, err := json.Marshal(source)
+		if err != nil {
+			return projectConfigArguments{}, fmt.Errorf("encode health source in %s: %w", path, err)
+		}
+		flags = append(flags, "--health-source", string(encoded))
+	}
 	addString("--probe-model", document.ProbeModel)
 	addDurationMS("--probe-timeout-ms", document.ProbeTimeoutMS, &flags)
 	addDurationMS("--error-grace-ms", document.TerminalErrorGraceMS, &flags)

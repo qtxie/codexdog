@@ -19,6 +19,23 @@ type rpcResponse struct {
 
 type notificationHandler func(rpcMessage)
 
+type appServerClientInfo struct {
+	Name    string
+	Title   string
+	Version string
+}
+
+func (info appServerClientInfo) params() (map[string]any, error) {
+	if info.Name == "" || info.Version == "" {
+		return nil, errors.New("app-server client identity requires a name and version")
+	}
+	params := map[string]any{"name": info.Name, "version": info.Version}
+	if info.Title != "" {
+		params["title"] = info.Title
+	}
+	return params, nil
+}
+
 type jsonRPCClient struct {
 	url            string
 	requestTimeout time.Duration
@@ -60,8 +77,16 @@ func (c *jsonRPCClient) InitializeWithOptions(ctx context.Context, clientName st
 	if clientName == "" {
 		clientName = "codexdog"
 	}
-	_, err := c.Request(ctx, "initialize", map[string]any{
-		"clientInfo":   map[string]any{"name": clientName, "title": "Codexdog", "version": version},
+	return c.InitializeWithClientInfo(ctx, appServerClientInfo{Name: clientName, Title: "Codexdog", Version: version}, experimentalAPI)
+}
+
+func (c *jsonRPCClient) InitializeWithClientInfo(ctx context.Context, info appServerClientInfo, experimentalAPI bool) error {
+	clientInfo, err := info.params()
+	if err != nil {
+		return err
+	}
+	_, err = c.Request(ctx, "initialize", map[string]any{
+		"clientInfo":   clientInfo,
 		"capabilities": map[string]any{"experimentalApi": experimentalAPI},
 	})
 	if err != nil {

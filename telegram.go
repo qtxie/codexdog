@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,81 @@ const (
 )
 
 var telegramDefaultBackoff = []time.Duration{250 * time.Millisecond, time.Second, 3 * time.Second}
+
+// telegramPollLock coordinates Codexdog Telegram controllers for the current
+// user. Telegram permits only one long poll stream per token, so failing before
+// Start is clearer and safer than letting Telegram terminate one of the
+// competing streams with HTTP 409.
+type telegramPollLock struct {
+	path  string
+	value string
+}
+
+func telegramPollLockPath(statePath, token string) string {
+	statePath = strings.TrimSpace(statePath)
+	token = strings.TrimSpace(token)
+	if statePath == "" || token == "" {
+		return ""
+	}
+	root := ""
+	if base := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); base != "" {
+		root = filepath.Join(base, "codex-supervisor")
+	} else if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		root = filepath.Join(home, ".local", "state", "codex-supervisor")
+	} else {
+		root = filepath.Dir(statePath)
+	}
+	sum := sha256.Sum256([]byte(token))
+	return filepath.Join(root, "telegram-poll-"+hex.EncodeToString(sum[:8])+".lock")
+}
+
+func acquireTelegramPollLock(path string) (*telegramPollLock, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	value := fmt.Sprintf("%d:%s", os.Getpid(), randomControlToken(12))
+	for attempt := 0; attempt < 3; attempt++ {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			if _, writeErr := file.WriteString(value); writeErr != nil {
+				_ = file.Close()
+				_ = os.Remove(path)
+				return nil, writeErr
+			}
+			if closeErr := file.Close(); closeErr != nil {
+				_ = os.Remove(path)
+				return nil, closeErr
+			}
+			return &telegramPollLock{path: path, value: value}, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		data, _ := os.ReadFile(path)
+		pidText := strings.SplitN(string(data), ":", 2)[0]
+		pid, _ := strconv.Atoi(pidText)
+		if pid > 0 && processExists(pid) {
+			return nil, fmt.Errorf("another Codexdog process (PID %d) is already polling this Telegram bot", pid)
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return nil, removeErr
+		}
+	}
+	return nil, errors.New("could not acquire the Telegram polling lock")
+}
+
+func (l *telegramPollLock) Release() {
+	if l == nil {
+		return
+	}
+	data, err := os.ReadFile(l.path)
+	if err == nil && string(data) == l.value {
+		_ = os.Remove(l.path)
+	}
+}
 
 // telegramClientOptions controls the Bot API transport. The token is kept only
 // in memory and is never included in returned errors.
@@ -809,11 +886,45 @@ type telegramController struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	done         chan struct{}
+	pollLockPath string
+	pollLock     *telegramPollLock
 	out          chan telegramOutbound
+	starting     bool
 	started      bool
 	notify       bool
 	lastNotify   string
 	lastNotifyAt time.Time
+}
+
+func (c *telegramController) acquirePollLock() error {
+	c.mu.Lock()
+	if c.pollLock != nil || c.pollLockPath == "" {
+		c.mu.Unlock()
+		return nil
+	}
+	path := c.pollLockPath
+	c.mu.Unlock()
+	pollLock, err := acquireTelegramPollLock(path)
+	if err != nil {
+		return fmt.Errorf("start Telegram polling: %w", err)
+	}
+	c.mu.Lock()
+	if c.pollLock != nil {
+		c.mu.Unlock()
+		pollLock.Release()
+		return nil
+	}
+	c.pollLock = pollLock
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *telegramController) releasePollLock() {
+	c.mu.Lock()
+	pollLock := c.pollLock
+	c.pollLock = nil
+	c.mu.Unlock()
+	pollLock.Release()
 }
 
 func newTelegramController(options supervisorOptions, execute func(context.Context, remoteCommand) (string, error), logger *fileLogger, onStateError func(error)) (*telegramController, error) {
@@ -868,6 +979,7 @@ func newTelegramController(options supervisorOptions, execute func(context.Conte
 		logger:       logger,
 		onStateError: onStateError,
 		notify:       options.TelegramNotify,
+		pollLockPath: telegramPollLockPath(options.TelegramStatePath, options.TelegramToken),
 		out:          make(chan telegramOutbound, 128),
 	}, nil
 }
@@ -877,10 +989,20 @@ func (c *telegramController) Start(parent context.Context) error {
 		parent = context.Background()
 	}
 	c.mu.Lock()
-	if c.started {
+	if c.started || c.starting {
 		c.mu.Unlock()
-		return errors.New("Telegram controller is already running")
+		return errors.New("Telegram controller is already starting or running")
 	}
+	c.starting = true
+	c.mu.Unlock()
+	if err := c.acquirePollLock(); err != nil {
+		c.mu.Lock()
+		c.starting = false
+		c.mu.Unlock()
+		return err
+	}
+	c.mu.Lock()
+	c.starting = false
 	c.ctx, c.cancel = context.WithCancel(parent)
 	c.done = make(chan struct{})
 	c.started = true
@@ -943,11 +1065,18 @@ func (c *telegramController) Stop() {
 	if done != nil {
 		select {
 		case <-done:
+			c.releasePollLock()
 		case <-time.After(3 * time.Second):
 			if c.logger != nil {
 				c.logger.Log("Timed out waiting for Telegram controller to stop")
 			}
+			go func() {
+				<-done
+				c.releasePollLock()
+			}()
 		}
+	} else {
+		c.releasePollLock()
 	}
 }
 

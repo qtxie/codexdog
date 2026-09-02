@@ -33,6 +33,7 @@ type proxyBridge struct {
 	downstream    *websocket.Conn
 	upstream      *websocket.Conn
 	clientName    string
+	clientTitle   string
 	clientVersion string
 	downMu        sync.Mutex
 	upMu          sync.Mutex
@@ -259,12 +260,17 @@ func (p *tuiProxy) IsPrimary(connectionID string) bool {
 }
 
 func (p *tuiProxy) PrimaryClientInfo() (string, string) {
+	info := p.PrimaryClientIdentity()
+	return info.Name, info.Version
+}
+
+func (p *tuiProxy) PrimaryClientIdentity() appServerClientInfo {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if bridge := p.bridges[p.primary]; bridge != nil {
-		return bridge.clientName, bridge.clientVersion
+		return appServerClientInfo{Name: bridge.clientName, Title: bridge.clientTitle, Version: bridge.clientVersion}
 	}
-	return "", ""
+	return appServerClientInfo{}
 }
 
 func (p *tuiProxy) recordClientInfo(connectionID string, params map[string]any) {
@@ -273,10 +279,12 @@ func (p *tuiProxy) recordClientInfo(connectionID string, params map[string]any) 
 		return
 	}
 	name, _ := readString(info["name"])
+	title, _ := readString(info["title"])
 	clientVersion, _ := readString(info["version"])
 	p.mu.Lock()
 	if bridge := p.bridges[connectionID]; bridge != nil {
 		bridge.clientName = name
+		bridge.clientTitle = title
 		bridge.clientVersion = clientVersion
 	}
 	p.mu.Unlock()

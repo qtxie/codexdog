@@ -446,6 +446,62 @@ func TestPublicTelegramHubStatusOmitsControlToken(t *testing.T) {
 	}
 }
 
+func TestTelegramHubStopNotificationIncludesReason(t *testing.T) {
+	if got := telegramHubStopNotification(telegramHubState{StoppedReason: "stop requested"}); got != "Codexdog Telegram hub is stopping." {
+		t.Fatalf("explicit stop notification = %q", got)
+	}
+	got := telegramHubStopNotification(telegramHubState{StoppedReason: "Telegram rejected getUpdates because another process is polling this bot token"})
+	if !strings.Contains(got, "another process is polling this bot token") {
+		t.Fatalf("diagnostic stop notification = %q", got)
+	}
+}
+
+func TestTelegramHubPollingConflictDoesNotStopHub(t *testing.T) {
+	hub := testTelegramHub(t, t.TempDir())
+	hub.ctx, hub.cancel = context.WithCancel(context.Background())
+	defer hub.cancel()
+	hub.state.Phase = "running"
+	hub.recordTelegramState(&telegramAPIError{
+		Method:      "getUpdates",
+		StatusCode:  http.StatusConflict,
+		ErrorCode:   http.StatusConflict,
+		Description: "terminated by another getUpdates request",
+	})
+	state := hub.snapshot()
+	if state.Phase != "running" || state.StoppedReason != "" || !strings.Contains(state.TelegramLastError, "getUpdates") {
+		t.Fatalf("hub state after polling conflict = %#v", state)
+	}
+	select {
+	case <-hub.ctx.Done():
+		t.Fatal("polling conflict canceled the Telegram hub")
+	default:
+	}
+}
+
+func TestTelegramHubPreflightAllowsPollingConflictToRecover(t *testing.T) {
+	api := &telegramFakeAPI{errors: []error{&telegramAPIError{
+		Method:      "getUpdates",
+		StatusCode:  http.StatusConflict,
+		ErrorCode:   http.StatusConflict,
+		Description: "terminated by another getUpdates request",
+	}}}
+	poller, err := newTelegramPoller(api, telegramPollerOptions{PollTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := testTelegramHub(t, t.TempDir())
+	hub.ctx, hub.cancel = context.WithCancel(context.Background())
+	defer hub.cancel()
+	hub.telegram = &telegramController{client: api, poller: poller}
+	if err := hub.preflightTelegram(); err != nil {
+		t.Fatalf("preflight rejected a polling conflict: %v", err)
+	}
+	state := hub.snapshot()
+	if !strings.Contains(state.TelegramLastError, "preflight") {
+		t.Fatalf("preflight conflict was not recorded: %#v", state)
+	}
+}
+
 func TestTelegramHubStateNeverPersistsBotToken(t *testing.T) {
 	root := t.TempDir()
 	hub := testTelegramHub(t, root)

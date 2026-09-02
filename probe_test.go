@@ -17,6 +17,8 @@ type mockRPC struct {
 	failure      *turnError
 	turnStarts   int
 	threadStarts int
+	turnModel    string
+	threadModel  string
 }
 
 func (m *mockRPC) AddNotificationHandler(handler notificationHandler) func() {
@@ -26,16 +28,18 @@ func (m *mockRPC) AddNotificationHandler(handler notificationHandler) func() {
 	return func() { m.mu.Lock(); m.handler = nil; m.mu.Unlock() }
 }
 
-func (m *mockRPC) Request(_ context.Context, method string, _ map[string]any) (any, error) {
+func (m *mockRPC) Request(_ context.Context, method string, params map[string]any) (any, error) {
 	switch method {
 	case "thread/start":
 		m.mu.Lock()
 		m.threadStarts++
+		m.threadModel, _ = readString(params["model"])
 		m.mu.Unlock()
 		return map[string]any{"thread": map[string]any{"id": "health-thread"}}, nil
 	case "turn/start":
 		m.mu.Lock()
 		m.turnStarts++
+		m.turnModel, _ = readString(params["model"])
 		turnID := fmt.Sprintf("health-turn-%d", m.turnStarts)
 		status := m.status
 		handler := m.handler
@@ -66,10 +70,10 @@ func TestProviderProbe(t *testing.T) {
 	rpc := &mockRPC{}
 	probe := newProviderProbe(rpc, providerProbeOptions{CWD: t.TempDir(), Timeout: time.Second})
 	defer probe.Dispose()
-	if result := probe.Check(context.Background()); !result.Healthy {
+	if result := probe.Check(context.Background(), "", ""); !result.Healthy {
 		t.Fatalf("healthy canary failed: %#v", result)
 	}
-	if result := probe.Check(context.Background()); !result.Healthy {
+	if result := probe.Check(context.Background(), "", ""); !result.Healthy {
 		t.Fatalf("second healthy canary failed: %#v", result)
 	}
 	rpc.mu.Lock()
@@ -84,7 +88,7 @@ func TestProviderProbeClassifiesFailure(t *testing.T) {
 	rpc := &mockRPC{status: "failed"}
 	probe := newProviderProbe(rpc, providerProbeOptions{CWD: t.TempDir(), Timeout: time.Second})
 	defer probe.Dispose()
-	result := probe.Check(context.Background())
+	result := probe.Check(context.Background(), "", "")
 	if result.Healthy || result.Failure == nil || result.Failure.Disposition != "transient" || result.Failure.HTTPStatus != 503 {
 		t.Fatalf("unexpected probe result: %#v", result)
 	}
@@ -99,7 +103,7 @@ func TestProviderProbeTreatsHTTP200StreamDisconnectAsTransient(t *testing.T) {
 	}}
 	probe := newProviderProbe(rpc, providerProbeOptions{CWD: t.TempDir(), Timeout: time.Second})
 	defer probe.Dispose()
-	result := probe.Check(context.Background())
+	result := probe.Check(context.Background(), "", "")
 	if result.Healthy || result.Failure == nil || result.Failure.Disposition != "transient" || result.Failure.Code != "responseTooManyFailedAttempts" || result.Failure.HTTPStatus != 200 {
 		t.Fatalf("unexpected probe result: %#v", result)
 	}

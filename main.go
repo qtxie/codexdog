@@ -16,7 +16,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-const version = "0.6.0"
+const version = "0.6.1"
 
 var defaultBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 60 * time.Second}
 
@@ -90,6 +90,12 @@ func run(argv []string) (int, error) {
 			fmt.Printf("Primary client: %s\n", valueOrDash(formatClientIdentity(state.PrimaryClient, state.PrimaryClientVersion)))
 			fmt.Printf("Automatic resumes: %d\n", state.AutomaticResumeCount)
 			fmt.Printf("Stall resumes: %d\n", state.StallRecoveryCount)
+			fmt.Printf("Health status: %s\n", valueOrDash(state.HealthState))
+			fmt.Printf("Health target: %s\n", valueOrDash(formatHealthTarget(state.HealthModel, state.HealthProvider)))
+			fmt.Printf("Health detail: %s\n", valueOrDash(state.HealthDetail))
+			for _, observation := range state.HealthObservations {
+				fmt.Println(formatHealthObservationState(observation))
+			}
 			fmt.Printf("Last turn activity: %s\n", valueOrDash(state.LastTurnActivityAt))
 			fmt.Printf("Stall suspected: %s\n", valueOrDash(state.StallSuspectedAt))
 			fmt.Printf("Watchdog pause: %s\n", valueOrDash(state.StallPausedReason))
@@ -222,6 +228,7 @@ func parseArgumentsWithProjectConfig(argv []string, configPresence projectConfig
 		CWD: cwd, CodexPath: "codex", ProbeTimeout: 120 * time.Second, TerminalErrorGrace: 5 * time.Second,
 		ProbeSuccesses: 2, Backoff: append([]time.Duration(nil), defaultBackoff...), MaxAutoResumes: 5,
 		StallConfirm: 30 * time.Second, StallInterruptTimeout: 15 * time.Second, MaxStallResumes: 2,
+		HealthChecks:        defaultHealthCheckOptions(),
 		TelegramPollTimeout: telegramDefaultPollTimeout, TelegramNotify: true,
 		WeChatPollTimeout: 35 * time.Second, WeChatLoginTimeout: wechatDefaultLoginTimeout, WeChatOpenBrowser: true, WeChatNotify: true,
 	}
@@ -270,6 +277,7 @@ func parseArgumentsWithProjectConfig(argv []string, configPresence projectConfig
 	jsonOutput := false
 	commandArgs := []string{}
 	doctorCanary := false
+	typedHealthConfigured := false
 	valueAfter := func(flag string) (string, error) {
 		index++
 		if index >= len(argv) || argv[index] == "" {
@@ -318,6 +326,42 @@ func parseArgumentsWithProjectConfig(argv []string, configPresence projectConfig
 				return parsedArguments{}, err
 			}
 			options.HealthURL = value
+		case "--health-source":
+			typedHealthConfigured = true
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			source, err := parseHealthSourceSpec(value)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.HealthChecks.Sources = append(options.HealthChecks.Sources, source)
+		case "--health-policy":
+			typedHealthConfigured = true
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.HealthChecks.Policy = value
+		case "--health-unknown-policy":
+			typedHealthConfigured = true
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.HealthChecks.UnknownPolicy = value
+		case "--health-max-age-ms":
+			typedHealthConfigured = true
+			value, err := valueAfter(arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			parsed, err := positiveInteger(value, arg)
+			if err != nil {
+				return parsedArguments{}, err
+			}
+			options.HealthChecks.MaxAge = time.Duration(parsed) * time.Millisecond
 		case "--probe-model":
 			value, err := valueAfter(arg)
 			if err != nil {
@@ -575,6 +619,13 @@ func parseArgumentsWithProjectConfig(argv []string, configPresence projectConfig
 	options.TelegramAllowedChats = uniqueInt64(options.TelegramAllowedChats)
 	options.TelegramAllowedUsers = uniqueInt64(options.TelegramAllowedUsers)
 	options.WeChatAllowedUsers = uniqueStrings(options.WeChatAllowedUsers)
+	if strings.TrimSpace(options.HealthURL) != "" && typedHealthConfigured {
+		return parsedArguments{}, errors.New("--health-url cannot be combined with typed health settings")
+	}
+	options.HealthChecks, err = normalizeHealthCheckOptions(options.HealthChecks)
+	if err != nil {
+		return parsedArguments{}, err
+	}
 	options.TelegramStatePath = filepath.Join(absoluteRoot, "telegram-"+workspaceKey(options.CWD)+".json")
 	options.WeChatCredentialsPath = filepath.Join(absoluteRoot, "wechat-"+workspaceKey(options.CWD)+".json")
 	options.WeChatQRCodePath = filepath.Join(absoluteRoot, "wechat-login-"+workspaceKey(options.CWD)+".png")
@@ -615,7 +666,8 @@ func hasWeChatDisabledFlag(argv []string) bool {
 
 func optionTakesValue(arg string) bool {
 	switch arg {
-	case "-C", "--cwd", "--codex", "--state-dir", "--health-url", "--probe-model",
+	case "-C", "--cwd", "--codex", "--state-dir", "--health-url", "--health-source",
+		"--health-policy", "--health-unknown-policy", "--health-max-age-ms", "--probe-model",
 		"--probe-timeout-ms", "--probe-successes", "--error-grace-ms", "--max-auto-resumes",
 		"--stall-timeout-ms", "--stall-confirm-ms", "--stall-interrupt-timeout-ms",
 		"--max-stall-resumes", "--tool-stall-timeout-ms", "--telegram-token", "--telegram-token-file",
@@ -760,7 +812,12 @@ Options:
                                start also reads DIR/.codexdog when present
   --codex PATH                Codex executable (default: codex)
   -c, --config KEY=VALUE      Codex config override; repeatable
-  --health-url URL            Optional cheap health endpoint checked before canaries
+  --health-url URL            Legacy HTTP-status endpoint checked before canaries
+  --health-source SOURCE      Typed status source; URL, TYPE=URL, or JSON; repeatable
+  --health-policy POLICY      Multi-source policy: any or all (default: any)
+  --health-unknown-policy POLICY
+                               Unknown-source behavior: canary or block (default: canary)
+  --health-max-age-ms MS      Maximum status observation age (default: 180000)
   --probe-model MODEL         Optional model override for health canaries
   --probe-timeout-ms MS       Canary timeout (default: 120000)
   --probe-successes N         Successes required before resume (default: 2)
@@ -873,7 +930,15 @@ func runProtocolSmokeWithOutput(options supervisorOptions, canary, output bool) 
 		return 1, err
 	}
 	defer rpc.Close()
-	if err := rpc.Initialize(context.Background()); err != nil {
+	clientInfo := appServerClientInfo{Name: "codexdog", Title: "Codexdog", Version: version}
+	if canary {
+		codexVersion, err := installedCodexVersion(context.Background(), options)
+		if err != nil {
+			return 1, err
+		}
+		clientInfo = appServerClientInfo{Name: "codex-tui", Version: codexVersion}
+	}
+	if err := rpc.InitializeWithClientInfo(context.Background(), clientInfo, false); err != nil {
 		return 1, err
 	}
 	if _, err := rpc.Request(context.Background(), "thread/list", map[string]any{"limit": 1}); err != nil {
@@ -901,7 +966,15 @@ func runProtocolSmokeWithOutput(options supervisorOptions, canary, output bool) 
 		return 1, err
 	}
 	defer client.Close(websocket.StatusNormalClosure, "smoke complete")
-	initData, _ := json.Marshal(map[string]any{"id": "smoke-init", "method": "initialize", "params": map[string]any{"clientInfo": map[string]any{"name": "codexdog_smoke", "version": version}}})
+	smokeClientInfo := appServerClientInfo{Name: "codexdog_smoke", Version: version}
+	if canary {
+		smokeClientInfo = clientInfo
+	}
+	smokeClientParams, err := smokeClientInfo.params()
+	if err != nil {
+		return 1, err
+	}
+	initData, _ := json.Marshal(map[string]any{"id": "smoke-init", "method": "initialize", "params": map[string]any{"clientInfo": smokeClientParams}})
 	if err := client.Write(context.Background(), websocket.MessageText, initData); err != nil {
 		return 1, err
 	}
@@ -942,9 +1015,9 @@ func runProtocolSmokeWithOutput(options supervisorOptions, canary, output bool) 
 		return 1, errors.New("app-server did not return the smoke-test thread status")
 	}
 	if canary {
-		probe := newProviderProbe(rpc, providerProbeOptions{CWD: options.CWD, Timeout: options.ProbeTimeout, HealthURL: options.HealthURL, Model: options.ProbeModel})
+		probe := newProviderProbe(rpc, providerProbeOptions{CWD: options.CWD, Timeout: options.ProbeTimeout, HealthURL: options.HealthURL, HealthChecks: options.HealthChecks, Model: options.ProbeModel})
 		defer probe.Dispose()
-		result := probe.Check(context.Background())
+		result := probe.Check(context.Background(), "", "")
 		if !result.Healthy {
 			if result.Failure == nil {
 				return 1, errors.New("provider canary failed")
