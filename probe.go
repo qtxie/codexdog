@@ -8,8 +8,11 @@ import (
 	"time"
 )
 
+const healthGateFailuresBeforeProbe = 3
+
 type probeResult struct {
 	Healthy            bool
+	ProbeAttempted     bool
 	Failure            *classifiedFailure
 	RetryAfter         time.Duration
 	HealthState        string
@@ -36,15 +39,17 @@ type turnCompletion struct {
 }
 
 type providerProbe struct {
-	rpc               rpcRequester
-	options           providerProbeOptions
-	mu                sync.Mutex
-	healthThreadID    string
-	healthThreadModel string
-	health            *healthChecker
-	completions       map[string]turnCompletion
-	waiters           map[string]chan turnCompletion
-	unsubscribe       func()
+	rpc                rpcRequester
+	options            providerProbeOptions
+	mu                 sync.Mutex
+	healthThreadID     string
+	healthThreadModel  string
+	healthGateTarget   string
+	healthGateFailures int
+	health             *healthChecker
+	completions        map[string]turnCompletion
+	waiters            map[string]chan turnCompletion
+	unsubscribe        func()
 }
 
 func newProviderProbe(rpc rpcRequester, options providerProbeOptions) *providerProbe {
@@ -58,6 +63,14 @@ func newProviderProbe(rpc rpcRequester, options providerProbeOptions) *providerP
 }
 
 func (p *providerProbe) Check(ctx context.Context, runtime ...string) probeResult {
+	return p.check(ctx, false, runtime...)
+}
+
+func (p *providerProbe) CheckNow(ctx context.Context, runtime ...string) probeResult {
+	return p.check(ctx, true, runtime...)
+}
+
+func (p *providerProbe) check(ctx context.Context, forceProbe bool, runtime ...string) probeResult {
 	runtimeModel, runtimeProvider := "", ""
 	if len(runtime) > 0 {
 		runtimeModel = runtime[0]
@@ -79,18 +92,36 @@ func (p *providerProbe) Check(ctx context.Context, runtime ...string) probeResul
 		result.HealthObservations = observations
 		return result
 	}
+	finishProbe := func(result probeResult) probeResult {
+		result.ProbeAttempted = true
+		return finish(result)
+	}
 	if p.health != nil {
 		gate := p.health.check(ctx, model, runtimeProvider, p.options.Timeout)
 		healthState = gate.State
 		healthDetail = gate.Detail
 		observations = gate.Observations
-		if gate.State == healthStateUnhealthy || gate.State == healthStateUnknown && p.health.options.UnknownPolicy == healthUnknownBlock {
+		runProbe, failures := true, 0
+		if !forceProbe {
+			runProbe, failures = p.shouldProbeAfterHealthGate(gate.State, model, runtimeProvider)
+		}
+		if !runProbe {
+			if failures > 0 {
+				healthDetail = appendHealthDetail(healthDetail, fmt.Sprintf("real Codex probe deferred after %d/%d consecutive status failures", failures, healthGateFailuresBeforeProbe))
+			}
 			return finish(healthGateProbeFailure(gate))
+		}
+		if gate.State != healthStateHealthy {
+			if forceProbe {
+				healthDetail = appendHealthDetail(healthDetail, "running explicitly requested real Codex probe despite status result")
+			} else {
+				healthDetail = appendHealthDetail(healthDetail, fmt.Sprintf("running real Codex probe after %d consecutive status failures", healthGateFailuresBeforeProbe))
+			}
 		}
 	}
 	threadID, err := p.ensureHealthThread(ctx, model)
 	if err != nil {
-		return finish(probeFailure(err))
+		return finishProbe(probeFailure(err))
 	}
 	params := map[string]any{
 		"threadId":       threadID,
@@ -106,30 +137,62 @@ func (p *providerProbe) Check(ctx context.Context, runtime ...string) probeResul
 	defer cancel()
 	value, err := p.rpc.Request(requestCtx, "turn/start", params)
 	if err != nil {
-		return finish(probeFailure(err))
+		return finishProbe(probeFailure(err))
 	}
 	object, _ := asObject(value)
 	started, ok := readTurn(object["turn"])
 	if !ok {
 		failure := classifyFailure(turnError{Message: "Health probe did not return a turn"})
-		return finish(probeResult{Failure: &failure})
+		return finishProbe(probeResult{Failure: &failure})
 	}
 	completion, err := p.waitForCompletion(requestCtx, started.ID)
 	if err != nil {
 		interruptCtx, interruptCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_, _ = p.rpc.Request(interruptCtx, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": started.ID})
 		interruptCancel()
-		return finish(probeFailure(err))
+		return finishProbe(probeFailure(err))
 	}
 	if completion.Status == "completed" {
-		return finish(probeResult{Healthy: true})
+		return finishProbe(probeResult{Healthy: true})
 	}
 	failureError := turnError{Message: "Health probe turn " + completion.Status}
 	if completion.Error != nil {
 		failureError = *completion.Error
 	}
 	failure := classifyFailure(failureError)
-	return finish(probeResult{Failure: &failure})
+	return finishProbe(probeResult{Failure: &failure})
+}
+
+func (p *providerProbe) shouldProbeAfterHealthGate(state, model, provider string) (bool, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	target := strings.TrimSpace(model) + "\x00" + strings.TrimSpace(provider)
+	if target != p.healthGateTarget {
+		p.healthGateTarget = target
+		p.healthGateFailures = 0
+	}
+	if state == healthStateHealthy {
+		p.healthGateFailures = 0
+		return true, 0
+	}
+	if state == healthStateUnknown && p.health.options.UnknownPolicy == healthUnknownBlock {
+		p.healthGateFailures = 0
+		return false, 0
+	}
+	p.healthGateFailures++
+	failures := p.healthGateFailures
+	if failures < healthGateFailuresBeforeProbe {
+		return false, failures
+	}
+	p.healthGateFailures = 0
+	return true, failures
+}
+
+func appendHealthDetail(detail, addition string) string {
+	if strings.TrimSpace(detail) == "" {
+		return addition
+	}
+	return detail + "; " + addition
 }
 
 func (p *providerProbe) Dispose() {

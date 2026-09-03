@@ -1017,7 +1017,7 @@ func runProtocolSmokeWithOutput(options supervisorOptions, canary, output bool) 
 	if canary {
 		probe := newProviderProbe(rpc, providerProbeOptions{CWD: options.CWD, Timeout: options.ProbeTimeout, HealthURL: options.HealthURL, HealthChecks: options.HealthChecks, Model: options.ProbeModel})
 		defer probe.Dispose()
-		result := probe.Check(context.Background(), "", "")
+		result := probe.CheckNow(context.Background(), "", "")
 		if !result.Healthy {
 			if result.Failure == nil {
 				return 1, errors.New("provider canary failed")

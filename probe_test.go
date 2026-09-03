@@ -109,6 +109,18 @@ func TestProviderProbeTreatsHTTP200StreamDisconnectAsTransient(t *testing.T) {
 	}
 }
 
+func TestDeferredStatusCheckPreservesProbeSuccesses(t *testing.T) {
+	if got := nextConsecutiveProbeSuccesses(1, probeResult{}); got != 1 {
+		t.Fatalf("deferred status check changed successes to %d", got)
+	}
+	if got := nextConsecutiveProbeSuccesses(1, probeResult{ProbeAttempted: true}); got != 0 {
+		t.Fatalf("failed probe left successes at %d", got)
+	}
+	if got := nextConsecutiveProbeSuccesses(1, probeResult{Healthy: true, ProbeAttempted: true}); got != 2 {
+		t.Fatalf("successful probe changed successes to %d", got)
+	}
+}
+
 func TestRecoveryRetriesAfterHealthEndpointHTTP404(t *testing.T) {
 	var mu sync.Mutex
 	checks := 0

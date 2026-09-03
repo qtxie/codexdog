@@ -2064,7 +2064,7 @@ func (s *supervisor) runRecovery(ctx context.Context, recovery recoveryContext) 
 			s.logger.Log(formatHealthObservation(observation))
 		}
 		if result.Healthy {
-			successes++
+			successes = nextConsecutiveProbeSuccesses(successes, result)
 			s.modifyState(func(state *supervisorState) { state.ConsecutiveProbeSuccesses = successes })
 			_ = s.persist()
 			s.logger.Log(fmt.Sprintf("Provider probe succeeded (%d/%d)", successes, s.options.ProbeSuccesses))
@@ -2072,8 +2072,8 @@ func (s *supervisor) runRecovery(ctx context.Context, recovery recoveryContext) 
 				s.notifyRemoteControls("Provider health checks passed; resuming Codex.")
 				return s.resumeThread(ctx, recovery)
 			}
-		} else {
-			successes = 0
+		} else if result.ProbeAttempted {
+			successes = nextConsecutiveProbeSuccesses(successes, result)
 			lastError := "Provider probe failed"
 			if result.Failure != nil {
 				lastError = formatFailure(*result.Failure)
@@ -2084,11 +2084,32 @@ func (s *supervisor) runRecovery(ctx context.Context, recovery recoveryContext) 
 			})
 			_ = s.persist()
 			s.logger.Log("Provider probe failed: " + lastError)
+		} else {
+			lastError := "Provider probe deferred by status sources"
+			if result.Failure != nil {
+				lastError = formatFailure(*result.Failure)
+			}
+			s.modifyState(func(state *supervisorState) {
+				state.ConsecutiveProbeSuccesses = successes
+				state.LastError = sanitizeText(lastError)
+			})
+			_ = s.persist()
+			s.logger.Log("Provider probe deferred: " + lastError)
 		}
 		retryAfter = result.RetryAfter
 		attempt++
 	}
 	return nil
+}
+
+func nextConsecutiveProbeSuccesses(current int, result probeResult) int {
+	if result.Healthy {
+		return current + 1
+	}
+	if result.ProbeAttempted {
+		return 0
+	}
+	return current
 }
 
 func (s *supervisor) resumeThread(ctx context.Context, recovery recoveryContext) error {

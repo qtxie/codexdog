@@ -349,10 +349,8 @@ API and selects the effective probe model:
 ```text
 codexdog start -C . \
   --health-source https://status.ciii.club/status/codex \
-  --probe-model gpt-5.6-sol
-
-codexdog start -C . \
   --health-source https://status.input.im/ \
+  --health-policy any \
   --probe-model gpt-5.6-sol
 ```
 
@@ -365,17 +363,22 @@ three states:
 - `unknown`: the source is unreachable, stale, malformed, or does not list the
   selected model.
 
-An unhealthy aggregate skips the real canary until the next recovery attempt.
-Healthy status still has to pass the real Codex canary. By default, an unknown
-status falls back to that canary so an external dashboard outage cannot block
-recovery. Set `--health-unknown-policy block` for fail-closed behavior.
+An unhealthy aggregate normally defers the real canary. After three consecutive
+status attempts without a healthy aggregate, Codexdog runs one fallback canary,
+then starts a new three-failure window if that canary fails. A healthy aggregate
+always runs the real canary immediately, and only a successful canary counts
+toward recovery. By default, unknown status uses the same three-failure fallback
+so an external dashboard outage cannot block recovery forever. Set
+`--health-unknown-policy block` to disable fallback canaries for unknown status.
+The three-failure window applies only to automatic recovery;
+`codexdog canary` and `codexdog doctor --canary` always run a real canary.
 
 With multiple sources, `--health-policy any` accepts one healthy source, rejects
 only when all sources are explicitly unhealthy, and otherwise returns unknown.
 `--health-policy all` rejects any unhealthy source and requires all sources to
-be healthy. Multiple sources should describe the same provider route. A source
-can include a `provider` selector in `.codexdog` when one configuration covers
-multiple providers.
+be healthy. Sources are checked concurrently. Multiple sources should describe
+the same provider route. A source can include a `provider` selector in
+`.codexdog` when one configuration covers multiple providers.
 
 Status samples older than `--health-max-age-ms` (three minutes by default) are
 unknown. Model resolution uses the source's explicit `model`, then

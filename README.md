@@ -345,22 +345,21 @@ A suspected turn must remain silent through `--stall-confirm-ms` and still repor
 --probe-model model-name
 ```
 
-When neither health option is configured, recovery uses the ephemeral Codex canary directly. Legacy `--health-url` should be a cheap endpoint for the custom provider. Any non-`2xx` response, including `400` or `404`, is treated as unhealthy and retried with the configured backoff. A successful endpoint check still requires the configured number of Codex canaries before resuming.
+When neither health option is configured, recovery uses the ephemeral Codex canary directly. Legacy `--health-url` should be a cheap endpoint for the custom provider. Any non-`2xx` response, including `400` or `404`, is treated as unhealthy and retried with the configured backoff. A successful endpoint check still requires the configured number of Codex canaries before resuming. After three consecutive status failures, Codexdog runs one fallback canary so a broken status service cannot block recovery forever.
 
 `--health-source` supports model-aware status dashboards. A bare Ciii or Input.im
 URL is detected automatically; `uptime-kuma=URL`, `input-im=URL`, and
 `http=URL` select an adapter explicitly. Status observations can only skip an
-expensive canary while a model is known to be down. A healthy or unavailable
-dashboard never replaces the real Codex canary. Use either legacy
+expensive canary while a model is known to be down. Typed sources are checked
+concurrently. A healthy or unavailable dashboard never replaces the real Codex
+canary. Explicit `canary` and `doctor --canary` commands always run one. Use either legacy
 `--health-url` or typed health sources, not both.
 
 ```powershell
 codexdog start -C . `
   --health-source https://status.ciii.club/status/codex `
-  --probe-model gpt-5.6-sol
-
-codexdog start -C . `
   --health-source https://status.input.im/ `
+  --health-policy any `
   --probe-model gpt-5.6-sol
 ```
 

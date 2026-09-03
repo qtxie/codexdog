@@ -283,6 +283,52 @@ func (s staticHealthSource) check(_ context.Context, model string, _ time.Durati
 	return observation
 }
 
+type coordinatedHealthSource struct {
+	config  healthSourceConfig
+	started chan<- string
+	release <-chan struct{}
+}
+
+func (s coordinatedHealthSource) configuration() healthSourceConfig { return s.config }
+func (s coordinatedHealthSource) check(_ context.Context, model string, _ time.Duration) healthObservation {
+	s.started <- s.config.Name
+	<-s.release
+	observation := newHealthObservation(s.config, model)
+	observation.State = healthStateHealthy
+	return observation
+}
+
+func TestHealthCheckerChecksSourcesConcurrently(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+	checker := &healthChecker{options: healthCheckOptions{Policy: healthPolicyAny, UnknownPolicy: healthUnknownCanary, MaxAge: time.Minute}}
+	for _, name := range []string{"ciii", "input-im"} {
+		checker.sources = append(checker.sources, coordinatedHealthSource{
+			config:  healthSourceConfig{Type: healthSourceHTTP, URL: "https://" + name + ".example", Name: name},
+			started: started,
+			release: release,
+		})
+	}
+	done := make(chan healthGateResult, 1)
+	go func() { done <- checker.check(context.Background(), "model", "", time.Second) }()
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case name := <-started:
+			seen[name] = true
+		case <-time.After(time.Second):
+			t.Fatal("health sources did not start concurrently")
+		}
+	}
+	releaseAll()
+	if result := <-done; result.State != healthStateHealthy || len(result.Observations) != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestHealthCheckerAggregationPolicies(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -320,11 +366,12 @@ func TestProviderProbeHealthGateControlsRealCanary(t *testing.T) {
 		wantHealthy   bool
 		wantState     string
 		wantTurns     int
+		wantAttempted bool
 	}{
-		{"healthy runs canary", map[string]any{"generated_at": now.Unix(), "services": []any{map[string]any{"model": "gpt-5.6-sol", "last": map[string]any{"ts": now.Unix(), "ok": true}}}}, healthUnknownCanary, true, healthStateHealthy, 1},
-		{"unhealthy skips canary", map[string]any{"generated_at": now.Unix(), "services": []any{map[string]any{"model": "gpt-5.6-sol", "last": map[string]any{"ts": now.Unix(), "ok": false}}}}, healthUnknownCanary, false, healthStateUnhealthy, 0},
-		{"unknown falls back to canary", map[string]any{"generated_at": now.Unix(), "services": []any{}}, healthUnknownCanary, true, healthStateUnknown, 1},
-		{"unknown can block", map[string]any{"generated_at": now.Unix(), "services": []any{}}, healthUnknownBlock, false, healthStateUnknown, 0},
+		{"healthy runs canary", map[string]any{"generated_at": now.Unix(), "services": []any{map[string]any{"model": "gpt-5.6-sol", "last": map[string]any{"ts": now.Unix(), "ok": true}}}}, healthUnknownCanary, true, healthStateHealthy, 1, true},
+		{"unhealthy defers canary", map[string]any{"generated_at": now.Unix(), "services": []any{map[string]any{"model": "gpt-5.6-sol", "last": map[string]any{"ts": now.Unix(), "ok": false}}}}, healthUnknownCanary, false, healthStateUnhealthy, 0, false},
+		{"unknown defers fallback canary", map[string]any{"generated_at": now.Unix(), "services": []any{}}, healthUnknownCanary, false, healthStateUnknown, 0, false},
+		{"unknown can block", map[string]any{"generated_at": now.Unix(), "services": []any{}}, healthUnknownBlock, false, healthStateUnknown, 0, false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -340,7 +387,7 @@ func TestProviderProbeHealthGateControlsRealCanary(t *testing.T) {
 			})
 			defer probe.Dispose()
 			result := probe.Check(context.Background(), "runtime-model", "provider")
-			if result.Healthy != test.wantHealthy || result.HealthState != test.wantState {
+			if result.Healthy != test.wantHealthy || result.HealthState != test.wantState || result.ProbeAttempted != test.wantAttempted {
 				t.Fatalf("result = %#v", result)
 			}
 			rpc.mu.Lock()
@@ -350,6 +397,103 @@ func TestProviderProbeHealthGateControlsRealCanary(t *testing.T) {
 				t.Fatalf("canary turns = %d, want %d", turns, test.wantTurns)
 			}
 		})
+	}
+}
+
+func TestProviderProbeFallsBackAfterThreeStatusFailures(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name string
+		body any
+	}{
+		{
+			name: "unhealthy",
+			body: map[string]any{
+				"generated_at": now.Unix(),
+				"services": []any{map[string]any{
+					"model": "gpt-5.6-sol",
+					"last":  map[string]any{"ts": now.Unix(), "ok": false},
+				}},
+			},
+		},
+		{
+			name: "unknown",
+			body: map[string]any{"generated_at": now.Unix(), "services": []any{}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				writeHealthJSON(t, response, test.body)
+			}))
+			defer server.Close()
+			rpc := &mockRPC{}
+			probe := newProviderProbe(rpc, providerProbeOptions{
+				CWD: t.TempDir(), Timeout: time.Second, Model: "gpt-5.6-sol",
+				HealthChecks: healthCheckOptions{Sources: []healthSourceConfig{{Type: healthSourceInputIM, URL: server.URL}}, UnknownPolicy: healthUnknownCanary},
+			})
+			defer probe.Dispose()
+			for attempt := 1; attempt <= healthGateFailuresBeforeProbe; attempt++ {
+				result := probe.Check(context.Background(), "runtime-model", "provider")
+				wantAttempted := attempt == healthGateFailuresBeforeProbe
+				if result.ProbeAttempted != wantAttempted || result.Healthy != wantAttempted {
+					t.Fatalf("attempt %d result = %#v", attempt, result)
+				}
+			}
+			rpc.mu.Lock()
+			turns := rpc.turnStarts
+			rpc.mu.Unlock()
+			if turns != 1 {
+				t.Fatalf("canary turns = %d, want 1", turns)
+			}
+			result := probe.Check(context.Background(), "runtime-model", "provider")
+			if result.ProbeAttempted {
+				t.Fatalf("failure counter did not reset after fallback probe: %#v", result)
+			}
+		})
+	}
+}
+
+func TestHealthyStatusResetsFallbackFailureCount(t *testing.T) {
+	probe := &providerProbe{health: &healthChecker{options: healthCheckOptions{UnknownPolicy: healthUnknownCanary}}}
+	for attempt := 1; attempt < healthGateFailuresBeforeProbe; attempt++ {
+		if run, _ := probe.shouldProbeAfterHealthGate(healthStateUnhealthy, "model", "provider"); run {
+			t.Fatalf("failure %d unexpectedly ran a probe", attempt)
+		}
+	}
+	if run, _ := probe.shouldProbeAfterHealthGate(healthStateHealthy, "model", "provider"); !run {
+		t.Fatal("healthy status did not run a probe")
+	}
+	for attempt := 1; attempt < healthGateFailuresBeforeProbe; attempt++ {
+		if run, _ := probe.shouldProbeAfterHealthGate(healthStateUnhealthy, "model", "provider"); run {
+			t.Fatalf("failure %d after reset unexpectedly ran a probe", attempt)
+		}
+	}
+}
+
+func TestProviderProbeCheckNowAlwaysRunsCanary(t *testing.T) {
+	now := time.Now().UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		writeHealthJSON(t, response, map[string]any{
+			"generated_at": now.Unix(),
+			"services": []any{map[string]any{
+				"model": "gpt-5.6-sol",
+				"last":  map[string]any{"ts": now.Unix(), "ok": false},
+			}},
+		})
+	}))
+	defer server.Close()
+	rpc := &mockRPC{}
+	probe := newProviderProbe(rpc, providerProbeOptions{
+		CWD: t.TempDir(), Timeout: time.Second, Model: "gpt-5.6-sol",
+		HealthChecks: healthCheckOptions{Sources: []healthSourceConfig{{Type: healthSourceInputIM, URL: server.URL}}},
+	})
+	defer probe.Dispose()
+	result := probe.CheckNow(context.Background(), "runtime-model", "provider")
+	if !result.ProbeAttempted || !result.Healthy || result.HealthState != healthStateUnhealthy || !strings.Contains(result.HealthDetail, "explicitly requested") {
+		t.Fatalf("result = %#v", result)
 	}
 }
 

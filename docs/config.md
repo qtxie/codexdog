@@ -60,6 +60,11 @@
   type = "uptime_kuma"
   url = "https://status.ciii.club/status/codex"
   name = "ciii"
+
+  [[health.sources]]
+  type = "input_im"
+  url = "https://status.input.im/"
+  name = "input-im"
   # model = "gpt-5.6-sol"        # 默认自动使用 probe_model 或当前线程模型
   # provider = "ciii"            # 可选，仅匹配这个 Codex model_provider
   ```
@@ -80,12 +85,14 @@
   `type` 支持 `http`、`uptime_kuma` 和 `input_im`。`http` 保留旧版 HTTP
   状态码语义；另外两种类型会读取 JSON API、选择目标模型并检查数据新鲜度。
   `healthy` 只允许继续执行真实 Codex canary，不会直接恢复线程；`unhealthy`
-  会跳过本次 canary；`unknown` 默认继续执行 canary，避免第三方状态页故障阻塞恢复。
+  和默认策略下的 `unknown` 会先暂缓 canary，连续 3 次状态页聚合结果未通过时执行
+  一次兜底 canary。只有真实 canary 成功才计入恢复条件；兜底 canary 失败后重新
+  开始 3 次计数。`unknown_policy = "block"` 会禁用 unknown 状态的兜底 canary。
 
   多个 source 只有在它们监控同一条 provider 路由时才应一起使用。`policy =
   "any"` 表示任一 source 健康即可，全部明确不健康时才阻止；`policy = "all"`
-  要求全部健康。source 的 `model` 优先级高于 `probe_model`，后者优先级高于当前
-  失败线程的实际模型。
+  要求全部健康。多个 source 会并行检测。source 的 `model` 优先级高于
+  `probe_model`，后者优先级高于当前失败线程的实际模型。
 
   ### Telegram 配置
 
