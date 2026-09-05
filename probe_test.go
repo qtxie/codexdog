@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ type mockRPC struct {
 	threadStarts int
 	turnModel    string
 	threadModel  string
+	threadParams map[string]any
+	turnParams   map[string]any
 }
 
 func (m *mockRPC) AddNotificationHandler(handler notificationHandler) func() {
@@ -34,12 +37,16 @@ func (m *mockRPC) Request(_ context.Context, method string, params map[string]an
 		m.mu.Lock()
 		m.threadStarts++
 		m.threadModel, _ = readString(params["model"])
+		m.threadParams = params
+		threadID := fmt.Sprintf("health-thread-%d", m.threadStarts)
 		m.mu.Unlock()
-		return map[string]any{"thread": map[string]any{"id": "health-thread"}}, nil
+		return map[string]any{"thread": map[string]any{"id": threadID}}, nil
 	case "turn/start":
 		m.mu.Lock()
 		m.turnStarts++
 		m.turnModel, _ = readString(params["model"])
+		m.turnParams = params
+		threadID, _ := readString(params["threadId"])
 		turnID := fmt.Sprintf("health-turn-%d", m.turnStarts)
 		status := m.status
 		handler := m.handler
@@ -57,7 +64,7 @@ func (m *mockRPC) Request(_ context.Context, method string, params map[string]an
 				turnValue["error"] = map[string]any{"message": failure.Message, "codexErrorInfo": failure.CodexErrorInfo}
 			}
 			if handler != nil {
-				handler(rpcMessage{Method: "turn/completed", Params: map[string]any{"threadId": "health-thread", "turn": turnValue}})
+				handler(rpcMessage{Method: "turn/completed", Params: map[string]any{"threadId": threadID, "turn": turnValue}})
 			}
 		}()
 		return map[string]any{"turn": map[string]any{"id": turnID, "status": "inProgress"}}, nil
@@ -79,8 +86,63 @@ func TestProviderProbe(t *testing.T) {
 	rpc.mu.Lock()
 	threadStarts := rpc.threadStarts
 	rpc.mu.Unlock()
-	if threadStarts != 1 {
+	if threadStarts != 2 {
 		t.Fatalf("health thread started %d times", threadStarts)
+	}
+}
+
+func TestProviderProbeUsesMinimalIsolatedContext(t *testing.T) {
+	rpc := &mockRPC{}
+	projectCWD := t.TempDir()
+	probe := newProviderProbe(rpc, providerProbeOptions{CWD: projectCWD, Timeout: time.Second})
+	defer probe.Dispose()
+	if result := probe.Check(context.Background(), "gpt-5.6-sol", ""); !result.Healthy {
+		t.Fatalf("health canary failed: %#v", result)
+	}
+	rpc.mu.Lock()
+	threadParams := rpc.threadParams
+	turnParams := rpc.turnParams
+	rpc.mu.Unlock()
+	threadCWD, _ := readString(threadParams["cwd"])
+	if threadCWD == "" || threadCWD == projectCWD {
+		t.Fatalf("probe cwd = %q, want an isolated directory", threadCWD)
+	}
+	if _, err := os.Stat(threadCWD); !os.IsNotExist(err) {
+		t.Fatalf("probe cwd still exists after probe: %v", err)
+	}
+	if got, _ := threadParams["ephemeral"].(bool); !got {
+		t.Fatal("probe thread is not ephemeral")
+	}
+	if got, _ := threadParams["baseInstructions"].(string); got != healthProbeBaseInstructions {
+		t.Fatalf("base instructions = %q", got)
+	}
+	if got, _ := threadParams["developerInstructions"].(string); got != healthProbeDeveloperInstructions {
+		t.Fatalf("developer instructions = %q", got)
+	}
+	config, _ := threadParams["config"].(map[string]any)
+	if servers, ok := config["mcp_servers"].(map[string]any); !ok || len(servers) != 0 {
+		t.Fatalf("mcp_servers config = %#v", config["mcp_servers"])
+	}
+	features, _ := config["features"].(map[string]any)
+	for _, name := range []string{"apps", "browser_use", "computer_use", "in_app_browser", "multi_agent", "plugins", "shell_snapshot", "shell_tool", "skill_mcp_dependency_install", "unified_exec", "web_search"} {
+		if enabled, ok := features[name].(bool); !ok || enabled {
+			t.Fatalf("feature %s = %#v, want false", name, features[name])
+		}
+	}
+	memories, _ := config["memories"].(map[string]any)
+	if memories["use_memories"] != false || memories["generate_memories"] != false {
+		t.Fatalf("memory config = %#v", memories)
+	}
+	if config["web_search"] != "disabled" || config["history"].(map[string]any)["persistence"] != "none" {
+		t.Fatalf("web/history config = %#v", config)
+	}
+	input, _ := turnParams["input"].([]any)
+	if len(input) != 1 {
+		t.Fatalf("probe input = %#v", turnParams["input"])
+	}
+	inputObject, _ := input[0].(map[string]any)
+	if got, _ := inputObject["text"].(string); got != healthProbeUserPrompt {
+		t.Fatalf("probe prompt = %q", got)
 	}
 }
 

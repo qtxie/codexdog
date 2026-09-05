@@ -3,12 +3,20 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
 const healthGateFailuresBeforeProbe = 3
+
+const (
+	healthProbeBaseInstructions      = "You are a provider health-check responder. Return only the requested marker."
+	healthProbeDeveloperInstructions = "Do not use tools, access files, inspect the workspace, or explain your answer."
+	healthProbeUserPrompt            = "Return the exact marker CODEX_PROVIDER_OK as plain text."
+)
 
 type probeResult struct {
 	Healthy            bool
@@ -42,19 +50,20 @@ type providerProbe struct {
 	rpc                rpcRequester
 	options            providerProbeOptions
 	mu                 sync.Mutex
-	healthThreadID     string
-	healthThreadModel  string
+	healthThreadIDs    map[string]struct{}
 	healthGateTarget   string
 	healthGateFailures int
 	health             *healthChecker
 	completions        map[string]turnCompletion
 	waiters            map[string]chan turnCompletion
 	unsubscribe        func()
+	probeConfigOnce    sync.Once
+	probeMCPConfig     map[string]any
 }
 
 func newProviderProbe(rpc rpcRequester, options providerProbeOptions) *providerProbe {
 	healthOptions := healthOptionsWithLegacyURL(options.HealthChecks, options.HealthURL)
-	probe := &providerProbe{rpc: rpc, options: options, completions: map[string]turnCompletion{}, waiters: map[string]chan turnCompletion{}}
+	probe := &providerProbe{rpc: rpc, options: options, healthThreadIDs: map[string]struct{}{}, completions: map[string]turnCompletion{}, waiters: map[string]chan turnCompletion{}}
 	if len(healthOptions.Sources) > 0 {
 		probe.health = newHealthChecker(healthOptions)
 	}
@@ -119,14 +128,17 @@ func (p *providerProbe) check(ctx context.Context, forceProbe bool, runtime ...s
 			}
 		}
 	}
-	threadID, err := p.ensureHealthThread(ctx, model)
+	threadCtx, threadCancel := context.WithTimeout(ctx, p.options.Timeout)
+	defer threadCancel()
+	threadID, probeCWD, err := p.startHealthThread(threadCtx, model)
 	if err != nil {
 		return finishProbe(probeFailure(err))
 	}
+	defer os.RemoveAll(probeCWD)
 	params := map[string]any{
 		"threadId":       threadID,
-		"input":          []any{map[string]any{"type": "text", "text": "Reply with exactly CODEX_PROVIDER_OK. Do not use tools."}},
-		"cwd":            p.options.CWD,
+		"input":          []any{map[string]any{"type": "text", "text": healthProbeUserPrompt}},
+		"cwd":            probeCWD,
 		"approvalPolicy": "never",
 		"sandboxPolicy":  map[string]any{"type": "readOnly"},
 	}
@@ -201,36 +213,92 @@ func (p *providerProbe) Dispose() {
 	}
 }
 
-func (p *providerProbe) ensureHealthThread(ctx context.Context, model string) (string, error) {
-	p.mu.Lock()
-	if p.healthThreadID != "" && p.healthThreadModel == model {
-		id := p.healthThreadID
-		p.mu.Unlock()
-		return id, nil
+func newProbeCWD() (string, error) {
+	probeCWD, err := os.MkdirTemp("", "codexdog-probe-")
+	if err != nil {
+		return "", err
 	}
-	p.mu.Unlock()
+	if err := os.WriteFile(filepath.Join(probeCWD, "codexdog-probe-instructions.md"), []byte("Provider health check. Return only the requested marker."), 0600); err != nil {
+		_ = os.RemoveAll(probeCWD)
+		return "", err
+	}
+	return probeCWD, nil
+}
+
+func (p *providerProbe) startHealthThread(ctx context.Context, model string) (string, string, error) {
+	probeCWD, err := newProbeCWD()
+	if err != nil {
+		return "", "", err
+	}
 	params := map[string]any{
-		"cwd": p.options.CWD, "ephemeral": true, "sandbox": "read-only", "approvalPolicy": "never",
-		"developerInstructions": "This is a provider health check. Never call tools. Reply only with the requested marker.",
+		"cwd":                   probeCWD,
+		"ephemeral":             true,
+		"sandbox":               "read-only",
+		"approvalPolicy":        "never",
+		"baseInstructions":      healthProbeBaseInstructions,
+		"developerInstructions": healthProbeDeveloperInstructions,
+		"config": map[string]any{
+			"mcp_servers": p.probeMCPServers(ctx),
+			"features": map[string]any{
+				"apps":                         false,
+				"browser_use":                  false,
+				"browser_use_external":         false,
+				"browser_use_full_cdp_access":  false,
+				"computer_use":                 false,
+				"in_app_browser":               false,
+				"multi_agent":                  false,
+				"plugins":                      false,
+				"shell_snapshot":               false,
+				"shell_tool":                   false,
+				"skill_mcp_dependency_install": false,
+				"unified_exec":                 false,
+				"web_search":                   false,
+			},
+			"memories": map[string]any{
+				"use_memories":      false,
+				"generate_memories": false,
+			},
+			"history":                 map[string]any{"persistence": "none"},
+			"model_instructions_file": filepath.Join(probeCWD, "codexdog-probe-instructions.md"),
+			"web_search":              "disabled",
+		},
 	}
 	if model != "" {
 		params["model"] = model
 	}
 	value, err := p.rpc.Request(ctx, "thread/start", params)
 	if err != nil {
-		return "", err
+		_ = os.RemoveAll(probeCWD)
+		return "", "", err
 	}
 	object, _ := asObject(value)
 	threadObject, _ := asObject(object["thread"])
 	id, ok := readString(threadObject["id"])
 	if !ok {
-		return "", fmt.Errorf("health probe did not return a thread id")
+		_ = os.RemoveAll(probeCWD)
+		return "", "", fmt.Errorf("health probe did not return a thread id")
 	}
 	p.mu.Lock()
-	p.healthThreadID = id
-	p.healthThreadModel = model
+	p.healthThreadIDs[id] = struct{}{}
 	p.mu.Unlock()
-	return id, nil
+	return id, probeCWD, nil
+}
+
+func (p *providerProbe) probeMCPServers(ctx context.Context) map[string]any {
+	p.probeConfigOnce.Do(func() {
+		p.probeMCPConfig = map[string]any{}
+		value, err := p.rpc.Request(ctx, "config/read", map[string]any{"includeLayers": false})
+		if err != nil {
+			return
+		}
+		object, _ := asObject(value)
+		config, _ := asObject(object["config"])
+		servers, _ := asObject(config["mcp_servers"])
+		for name := range servers {
+			p.probeMCPConfig[name] = map[string]any{"enabled": false}
+		}
+	})
+	return p.probeMCPConfig
 }
 
 func (p *providerProbe) handleNotification(message rpcMessage) {
@@ -239,7 +307,11 @@ func (p *providerProbe) handleNotification(message rpcMessage) {
 	}
 	threadID, _ := readString(message.Params["threadId"])
 	p.mu.Lock()
-	if threadID == "" || threadID != p.healthThreadID {
+	if threadID == "" {
+		p.mu.Unlock()
+		return
+	}
+	if _, ok := p.healthThreadIDs[threadID]; !ok {
 		p.mu.Unlock()
 		return
 	}
@@ -251,10 +323,12 @@ func (p *providerProbe) handleNotification(message rpcMessage) {
 	completion := turnCompletion{Status: parsed.Status, Error: parsed.Error}
 	if waiter := p.waiters[parsed.ID]; waiter != nil {
 		delete(p.waiters, parsed.ID)
+		delete(p.healthThreadIDs, threadID)
 		p.mu.Unlock()
 		waiter <- completion
 		return
 	}
+	delete(p.healthThreadIDs, threadID)
 	p.completions[parsed.ID] = completion
 	p.mu.Unlock()
 }

@@ -294,8 +294,13 @@ For a normal failed turn, recovery works as follows:
 3. If necessary, Codexdog reads the thread status and interrupts a turn that is
    still marked active. A thread waiting for approval or user input is not
    interrupted.
-4. Codexdog retries provider probes using `--backoff-ms`. By default the delays
-   are 2, 5, 10, 20, 30, and 60 seconds, with 60 seconds repeated afterward.
+4. Codexdog retries provider probes using `--backoff-ms`. Each canary uses a fresh
+   ephemeral Codex thread in an isolated temporary directory with a minimal
+   marker task. It does not reuse probe history or load the monitored project's
+   `AGENTS.md`, MCP servers, skills, or tool settings. Codex's app-server still
+   supplies its mandatory protocol metadata to the upstream request. By default
+   the delays are 2, 5, 10, 20, 30, and 60 seconds, with 60 seconds repeated
+   afterward.
 5. After the required consecutive canaries succeed, Codexdog resumes the exact
    thread. A non-complete saved `/goal` is reactivated directly; a normal thread
    receives a semantic continuation prompt.

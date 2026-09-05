@@ -295,7 +295,7 @@ State and redacted rotating logs are stored under `%LOCALAPPDATA%\codex-supervis
 2. Treat every terminal Codex error from a direct-input thread as recoverable, including authentication, configuration, `4xx`, `5xx`, timeout, usage-limit, and unknown errors. Error type and HTTP status are retained in state and logs for diagnosis.
 3. When Codex reports an error with `willRetry=false`, wait up to `--error-grace-ms` for the normal terminal event. Any continued activity restarts this grace period.
 4. If the terminal event is missing, read the thread status. A thread waiting for approval or user input is left alone. An active, non-waiting turn is interrupted; an already-idle thread proceeds directly to recovery.
-5. Probe through a dedicated ephemeral Codex thread using the same provider and authentication. The canary is instructed not to call tools.
+5. Probe through a fresh ephemeral Codex thread using the same provider and authentication. Probe threads use an isolated temporary workspace, replace the normal instruction file with a minimal health-check instruction, disable configured MCP/tools where supported, and send one explicit marker task. They never reuse probe history or the user's project context.
 6. Require two successful canaries by default.
 7. Continue the exact failed thread and workspace. If the thread has a non-complete persisted goal, reactivate it through `thread/goal/set` and let Codex's automatic goal continuation proceed without injecting a user prompt. Threads without an active goal use the normal semantic continuation prompt.
 8. For `cyberPolicy`, retry the same thread with `continue`, retry it with `继续`, then fork through the failed turn and try `continue` once on the new thread. These retries do not wait for provider probes.
