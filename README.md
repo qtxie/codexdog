@@ -13,7 +13,7 @@ troubleshooting.
 ## Requirements
 
 - Go 1.24 or newer to build
-- Codex CLI with `app-server` and `--remote` support (tested with 0.150.1)
+- Codex CLI with `app-server` and `--remote` support (tested with 0.153.4)
 - A working Codex login and provider configuration
 
 ## Build and install
@@ -95,16 +95,17 @@ codexdog status -C . --json
 codexdog stop -C .
 ```
 
-With Codex CLI 0.150.1, text and JSON status include the current thread's token
+With Codex CLI 0.153.4, text and JSON status include the current thread's token
 breakdown and estimated credit/USD usage, plus account credit balance and rate
 limit windows. Account-wide fields are shown only when the signed-in account and
 billing route provide them. Collection is best effort: a status RPC failure is
 reported as `usageLastError` and does not affect turn supervision or recovery.
 
-## Codex 0.150.1 session support
+## Codex 0.153.4 session support
 
 Codexdog records the active thread directory, session and project IDs, permission
-profile, approval policy, sandbox policy, model, and model provider from
+profile, approval policy, sandbox policy, model, model provider, and reasoning
+effort from
 app-server settings updates. The workspace selected by `-C` remains the stable
 state key; the active thread directory follows Codex `/cd` changes and is used
 for recovery continuations, so recovery does not silently return to the initial
@@ -118,7 +119,7 @@ can share the session without becoming the recovery target:
 codexdog agents -C . -- --no-alt-screen
 ```
 
-Codexdog also reports observed subagent status from Codex 0.150.1 and exposes
+Codexdog also reports observed subagent status from Codex 0.153.4 and exposes
 the same view through authenticated remote control:
 
 ```text
@@ -126,7 +127,15 @@ the same view through authenticated remote control:
 /recent [N]
 ```
 
-`/recent` uses the 0.150.1 experimental timeline API and falls back to the
+Codex CLI 0.153 adds opt-in context management with token-budget context,
+history notes, and the `new_context` tool (`features.context_management.experimental_mode`).
+This is controlled by Codex configuration and is only available for eligible
+ChatGPT-backed sessions; API-key sessions, custom providers, and temporary
+structured threads are excluded. It does not replace Codexdog's recovery
+continuation: threads without a saved goal still receive an explicit fallback
+prompt after a provider failure.
+
+`/recent` uses the 0.153.4 experimental timeline API and falls back to the
 bounded turns page, then stable thread history, when needed. MCP server runtime
 and authentication status are included in `status` output.
 
@@ -383,7 +392,7 @@ by Codexdog. `smoke` initializes the installed app-server and proxy, then
 creates and reads an ephemeral thread without consuming a model turn.
 `doctor --canary` explicitly opts into one minimal provider request.
 
-The protocol implementation targets the Codex CLI 0.150.1 app-server schema.
-The compatibility workflow keeps 0.150.1 pinned and exercises `latest` as a
+The protocol implementation targets the Codex CLI 0.153.4 app-server schema.
+The compatibility workflow keeps 0.153.4 pinned and exercises `latest` as a
 non-blocking early-warning job. Run `smoke` after upgrading Codex because
 app-server WebSocket transport is still experimental.

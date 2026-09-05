@@ -86,6 +86,7 @@ func formatRemoteStatus(state supervisorState) string {
 		"Permission profile: " + valueOrDash(state.ActivePermissionProfile),
 		"Sandbox: " + valueOrDash(state.SandboxPolicy),
 		"Model: " + valueOrDash(state.Model),
+		"Reasoning effort: " + valueOrDash(state.ReasoningEffort),
 		"Primary client: " + valueOrDash(formatClientIdentity(state.PrimaryClient, state.PrimaryClientVersion)),
 		"Turn: " + valueOrDash(state.ActiveTurnID),
 		"Manual pause: " + yesNo(state.ManualPaused),

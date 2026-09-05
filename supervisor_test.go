@@ -234,13 +234,14 @@ func TestThreadSettingsUpdatePreservesWorkspaceIdentity(t *testing.T) {
 			"sandboxPolicy":           map[string]any{"type": "workspaceWrite"},
 			"model":                   "gpt-5.6-sol",
 			"modelProvider":           "openai",
+			"reasoningEffort":         "high",
 		},
 	}})
 	state := s.stateSnapshot()
 	if state.CWD != workspace || state.EffectiveCWD != `D:\changed\directory` {
 		t.Fatalf("workspace identity/settings = %#v", state)
 	}
-	if state.ActivePermissionProfile != "team-safe" || state.ActivePermissionProfileExtends != ":workspace" || state.ApprovalPolicy != "on-request" || state.ApprovalsReviewer != "user" || state.SandboxPolicy != "workspaceWrite" || state.Model != "gpt-5.6-sol" || state.ModelProvider != "openai" {
+	if state.ActivePermissionProfile != "team-safe" || state.ActivePermissionProfileExtends != ":workspace" || state.ApprovalPolicy != "on-request" || state.ApprovalsReviewer != "user" || state.SandboxPolicy != "workspaceWrite" || state.Model != "gpt-5.6-sol" || state.ModelProvider != "openai" || state.ReasoningEffort != "high" {
 		t.Fatalf("thread settings = %#v", state)
 	}
 	s.handleServerMessage(rpcMessage{Method: "thread/settings/updated", Params: map[string]any{

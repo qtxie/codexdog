@@ -14,7 +14,8 @@ func TestAssessCodexCompatibility(t *testing.T) {
 		{version: "0.147.9", status: "fail"},
 		{version: "0.148.0", status: "warning"},
 		{version: "0.149.1", status: "warning"},
-		{version: "0.150.0", status: "pass"},
+		{version: "0.150.0", status: "warning"},
+		{version: "0.153.4", status: "pass"},
 	} {
 		if got := assessCodexCompatibility(test.version).Status; got != test.status {
 			t.Fatalf("compatibility(%s) = %s, want %s", test.version, got, test.status)
@@ -52,6 +53,7 @@ func TestDoctorSupervisorFromStateIncludesOnlyOperationalMetadata(t *testing.T) 
 		SandboxPolicy:           "workspaceWrite",
 		Model:                   "gpt-5.6-sol",
 		ModelProvider:           "openai",
+		ReasoningEffort:         "high",
 		PrimaryClient:           "codex-tui",
 		PrimaryClientVersion:    "0.149.1",
 		AppServerPort:           4101,
@@ -64,7 +66,7 @@ func TestDoctorSupervisorFromStateIncludesOnlyOperationalMetadata(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), state.ControlToken) || report.PrimaryClient != "codex-tui 0.149.1" || report.ControlPort != 4103 || !report.Live {
+	if strings.Contains(string(data), state.ControlToken) || report.PrimaryClient != "codex-tui 0.149.1" || report.ControlPort != 4103 || report.ReasoningEffort != "high" || !report.Live {
 		t.Fatalf("doctor supervisor = %s", data)
 	}
 }

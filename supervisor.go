@@ -912,6 +912,9 @@ func applyThreadSettings(state *supervisorState, settings threadSettings) {
 	if settings.ModelProvider != "" {
 		state.ModelProvider = settings.ModelProvider
 	}
+	if settings.ReasoningEffort != "" {
+		state.ReasoningEffort = settings.ReasoningEffort
+	}
 }
 
 func threadDirectInputCapability(threadObject map[string]any) (bool, bool) {

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const testedCodexVersion = "0.150.1"
+const testedCodexVersion = "0.153.4"
 const minimumCodexVersion = "0.148.0"
 
 var codexVersionPattern = regexp.MustCompile(`\b(\d+)\.(\d+)\.(\d+)\b`)

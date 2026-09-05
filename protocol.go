@@ -62,6 +62,7 @@ type threadSettings struct {
 	SandboxPolicy         string
 	Model                 string
 	ModelProvider         string
+	ReasoningEffort       string
 }
 
 func parseRPC(data []byte) (rpcMessage, bool) {
@@ -176,6 +177,7 @@ func readThreadSettings(params map[string]any) (string, threadSettings, bool) {
 		SandboxPolicy:     policySetting(object["sandboxPolicy"]),
 		Model:             stringSetting(object["model"]),
 		ModelProvider:     stringSetting(object["modelProvider"]),
+		ReasoningEffort:   stringSetting(object["reasoningEffort"]),
 	}
 	if profile, ok := asObject(object["activePermissionProfile"]); ok {
 		settings.PermissionProfile, _ = readString(profile["id"])

@@ -143,7 +143,7 @@ codexdog stop -C /path/to/project
 Codexdog identifies a supervisor by the absolute workspace path. Use the same
 `-C` value for `start`, `status`, and `stop`.
 
-On Codex CLI 0.150.1, status also reports the current thread's input, cached,
+On Codex CLI 0.153.4, status also reports the current thread's input, cached,
 cache-write, output, reasoning, and total tokens; estimated credit and USD use;
 account credit balance; and primary/secondary rate-limit windows. `--json`
 exposes these as `tokenUsage`, `usageEstimate`, `accountUsage`, and `rateLimits`.
@@ -152,10 +152,18 @@ that case Codexdog keeps supervising normally and records the read problem in
 `usageLastError`.
 
 Status also records the active thread directory, session/project IDs, permission
-profile, approval policy, sandbox policy, model, and provider. `-C` remains the
+profile, approval policy, sandbox policy, model, provider, and reasoning effort.
+`-C` remains the
 stable workspace and state-file identity. When Codex changes directory with
 `/cd`, `effectiveCwd` tracks the thread's actual directory and recovery uses it
 without changing the workspace key.
+
+Codex CLI 0.153 also has opt-in context management:
+`features.context_management.experimental_mode` enables token-budget context,
+history notes, and the `new_context` tool for eligible ChatGPT-backed sessions.
+It is unavailable for API-key sessions, custom providers, and temporary
+structured threads. Codexdog therefore keeps its explicit continuation prompt
+as the compatibility fallback when a thread has no saved goal.
 
 ## Pass settings and arguments to Codex
 
@@ -273,7 +281,7 @@ codexdog queue -C /path/to/project delete QUEUE_ID
 codexdog queue -C /path/to/project start QUEUE_ID
 ```
 
-Queue commands use Codex 0.150.1's experimental queue API. Submission client
+Queue commands use Codex 0.153.4's experimental queue API. Submission client
 message IDs are persisted so an operator can trace a queued request in state.
 
 ## Provider recovery
@@ -748,7 +756,7 @@ has expired.
 
 ### Usage, cost, or rate limits are missing
 
-These fields require Codex CLI 0.150.1 and depend on the signed-in account and
+These fields require Codex CLI 0.153.4 and depend on the signed-in account and
 billing route. Inspect `usageLastError` with `codexdog status --json`. A missing
 USD estimate or credit balance can be a valid backend response and does not
 indicate that recovery or the watchdog is broken.
@@ -780,7 +788,7 @@ Release with generated release notes. The three archives and their checksum
 files are attached to the release. Binaries are not signed or notarized.
 
 `.github/workflows/codex-compatibility.yml` separately runs unit tests, schema
-validation, and the no-model-turn smoke test against pinned Codex 0.150.1. A
+validation, and the no-model-turn smoke test against pinned Codex 0.153.4. A
 scheduled `latest` job is allowed to fail so upstream app-server changes are
 visible before they become release blockers. The build workflow also runs the
 Go race detector on Linux.

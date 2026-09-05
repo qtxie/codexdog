@@ -29,6 +29,7 @@ type supervisorState struct {
 	SandboxPolicy                  string                    `json:"sandboxPolicy,omitempty"`
 	Model                          string                    `json:"model,omitempty"`
 	ModelProvider                  string                    `json:"modelProvider,omitempty"`
+	ReasoningEffort                string                    `json:"reasoningEffort,omitempty"`
 	PrimaryClient                  string                    `json:"primaryClient,omitempty"`
 	PrimaryClientVersion           string                    `json:"primaryClientVersion,omitempty"`
 	Phase                          string                    `json:"phase"`

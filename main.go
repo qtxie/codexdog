@@ -87,6 +87,7 @@ func run(argv []string) (int, error) {
 			fmt.Printf("Sandbox: %s\n", valueOrDash(state.SandboxPolicy))
 			fmt.Printf("Model: %s\n", valueOrDash(state.Model))
 			fmt.Printf("Model provider: %s\n", valueOrDash(state.ModelProvider))
+			fmt.Printf("Reasoning effort: %s\n", valueOrDash(state.ReasoningEffort))
 			fmt.Printf("Primary client: %s\n", valueOrDash(formatClientIdentity(state.PrimaryClient, state.PrimaryClientVersion)))
 			fmt.Printf("Automatic resumes: %d\n", state.AutomaticResumeCount)
 			fmt.Printf("Stall resumes: %d\n", state.StallRecoveryCount)

@@ -30,6 +30,7 @@ type doctorSupervisor struct {
 	SandboxPolicy      string                   `json:"sandboxPolicy,omitempty"`
 	Model              string                   `json:"model,omitempty"`
 	ModelProvider      string                   `json:"modelProvider,omitempty"`
+	ReasoningEffort    string                   `json:"reasoningEffort,omitempty"`
 	PrimaryClient      string                   `json:"primaryClient,omitempty"`
 	AppServerPort      int                      `json:"appServerPort,omitempty"`
 	ProxyPort          int                      `json:"proxyPort,omitempty"`
@@ -167,6 +168,7 @@ func doctorSupervisorFromState(state supervisorState, live bool) doctorSuperviso
 		SandboxPolicy:      state.SandboxPolicy,
 		Model:              state.Model,
 		ModelProvider:      state.ModelProvider,
+		ReasoningEffort:    state.ReasoningEffort,
 		PrimaryClient:      formatClientIdentity(state.PrimaryClient, state.PrimaryClientVersion),
 		AppServerPort:      state.AppServerPort,
 		ProxyPort:          state.ProxyPort,
